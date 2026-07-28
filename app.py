@@ -18,6 +18,16 @@ if "uploader_token" not in st.session_state:
     st.session_state.uploader_token = 0
 
 
+# def reset_analysis():
+#     keys_to_clear = [
+#         "control_time_col", "control_cell_cols", "treatment_time_col", "treatment_cell_cols",
+#         "f0_mode", "f0_n", "add_stats"
+#     ]
+#     for k in keys_to_clear:
+#         if k in st.session_state:
+#             del st.session_state[k]
+#     st.session_state.uploader_token += 1
+#     st.rerun()
 def reset_analysis():
     keys_to_clear = [
         "control_time_col", "control_cell_cols", "treatment_time_col", "treatment_cell_cols",
@@ -27,8 +37,6 @@ def reset_analysis():
         if k in st.session_state:
             del st.session_state[k]
     st.session_state.uploader_token += 1
-    st.rerun()
-
 
 with st.sidebar:
     st.header("Analysis")
