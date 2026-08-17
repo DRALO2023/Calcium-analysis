@@ -1,4 +1,3 @@
-
 import io
 from datetime import datetime
 
@@ -11,7 +10,11 @@ from scipy import stats
 st.set_page_config(page_title="Calcium Analysis", layout="wide")
 
 st.title("Calcium Imaging Post-Analysis")
-st.write("Upload one control file and one treatment file. The app computes average ΔF/F0 traces, peak time, fade times, and multiple AUC metrics.")
+st.write(
+    "Upload one control file and one treatment file. "
+    "The app computes average ΔF/F0 traces, peak time, fade times, AUC metrics, "
+    "and intake/release rates."
+)
 
 if "uploader_token" not in st.session_state:
     st.session_state.uploader_token = 0
@@ -20,7 +23,7 @@ if "uploader_token" not in st.session_state:
 def reset_analysis():
     keys_to_clear = [
         "control_time_col", "control_cell_cols", "treatment_time_col", "treatment_cell_cols",
-        "f0_mode", "f0_n", "add_stats"
+        "f0_mode", "f0_n", "add_stats", "plot_positive_only"
     ]
     for k in keys_to_clear:
         if k in st.session_state:
@@ -32,14 +35,38 @@ with st.sidebar:
     st.header("Analysis")
     f0_mode = st.selectbox(
         "F0 definition",
-        ["First row", "Mean of first N rows"],
+        [
+            "First row",
+            "Mean of first N rows",
+            "Minimum value in trace",
+            "Lower quartile (25th percentile)"
+        ],
         key="f0_mode"
     )
     f0_n = 5
     if f0_mode == "Mean of first N rows":
-        f0_n = st.number_input("Number of rows for F0", min_value=1, value=5, step=1, key="f0_n")
-    add_stats = st.checkbox("Add statistics (SEM on graph, p-values)", value=False, key="add_stats")
-    st.button("Reset analysis / Upload new files", on_click=reset_analysis, use_container_width=True)
+        f0_n = st.number_input(
+            "Number of rows for F0",
+            min_value=1,
+            value=5,
+            step=1,
+            key="f0_n"
+        )
+    add_stats = st.checkbox(
+        "Add statistics (SEM on graph, p-values)",
+        value=False,
+        key="add_stats"
+    )
+    plot_positive_only = st.checkbox(
+        "Plot only positive ΔF/F0 (max(y, 0))",
+        value=False,
+        key="plot_positive_only"
+    )
+    st.button(
+        "Reset analysis / Upload new files",
+        on_click=reset_analysis,
+        use_container_width=True
+    )
 
 
 def read_table(uploaded_file):
@@ -53,7 +80,14 @@ def get_f0(series, mode, n_rows):
     s = pd.to_numeric(series, errors='coerce')
     if mode == "First row":
         return float(s.iloc[0])
-    return float(s.iloc[:n_rows].mean())
+    elif mode == "Mean of first N rows":
+        return float(s.iloc[:n_rows].mean())
+    elif mode == "Minimum value in trace":
+        return float(s.min())
+    elif mode == "Lower quartile (25th percentile)":
+        return float(s.quantile(0.25))
+    else:
+        return float(s.iloc[0])
 
 
 def compute_dff(df, time_col, cell_cols, mode, n_rows):
@@ -86,6 +120,32 @@ def first_drop_below_zero(x, y):
     return np.nan
 
 
+def slope_between(x, y, t_start, t_end):
+    mask = (x >= t_start) & (x <= t_end)
+    if mask.sum() < 3:
+        return np.nan
+    slope, _, _, _, _ = stats.linregress(x[mask], y[mask])
+    return float(slope)
+
+
+def find_zero_before_peak(x, y, peak_idx):
+    # Find last index <= peak_idx where y <= 0 (or use 0 if none)
+    for i in range(peak_idx, -1, -1):
+        if y[i] <= 0:
+            return float(x[i]), i
+    # Fallback: use first point
+    return float(x[0]), 0
+
+
+def find_zero_after_peak(x, y, peak_idx):
+    # Find first index >= peak_idx where y <= 0 (or use last if none)
+    for i in range(peak_idx, len(y)):
+        if y[i] <= 0:
+            return float(x[i]), i
+    # Fallback: use last point
+    return float(x[-1]), len(y) - 1
+
+
 def summarize_average_trace(avg_df):
     x = pd.to_numeric(avg_df["Time"], errors='coerce').to_numpy()
     y = pd.to_numeric(avg_df["Average_dF_F0"], errors='coerce').to_numpy()
@@ -99,6 +159,7 @@ def summarize_average_trace(avg_df):
     peak_x = float(x[peak_idx])
     peak_y = float(y[peak_idx])
 
+    # Fade A: first decrease after peak
     fade_a_x = np.nan
     fade_a_y = np.nan
     for i in range(peak_idx + 1, len(y)):
@@ -107,6 +168,7 @@ def summarize_average_trace(avg_df):
             fade_a_y = float(y[i])
             break
 
+    # Fade B: 50% of peak
     target_b = peak_y * 0.5
     fade_b_x = np.nan
     fade_b_y = np.nan
@@ -116,6 +178,7 @@ def summarize_average_trace(avg_df):
             fade_b_y = float(y[i])
             break
 
+    # Fade C: first <= 0
     fade_c_x = np.nan
     fade_c_y = np.nan
     for i in range(peak_idx + 1, len(y)):
@@ -123,6 +186,13 @@ def summarize_average_trace(avg_df):
             fade_c_x = float(x[i])
             fade_c_y = float(y[i])
             break
+
+    # Zero crossings around peak for rates
+    t_zero_before, idx_zero_before = find_zero_before_peak(x, y, peak_idx)
+    t_zero_after, idx_zero_after = find_zero_after_peak(x, y, peak_idx)
+
+    intake_rate = slope_between(x, y, t_zero_before, peak_x)
+    release_rate = slope_between(x, y, peak_x, t_zero_after)
 
     return {
         "Peak time": peak_x,
@@ -136,6 +206,10 @@ def summarize_average_trace(avg_df):
         "AUC whole": auc_signed(x, y),
         "AUC above baseline": auc_above_baseline(x, y),
         "First below zero": first_drop_below_zero(x, y),
+        "Intake rate": intake_rate,
+        "Release rate": release_rate,
+        "t_zero_before": t_zero_before,
+        "t_zero_after": t_zero_after,
     }
 
 
@@ -145,48 +219,213 @@ def make_avg_trace(dff_df):
     return pd.DataFrame({"Time": dff_df["Time"], "Average_dF_F0": avg})
 
 
-def build_single_plot_with_sem(avg_df, sem_df, label, color):
+def build_single_plot_with_sem(avg_df, sem_df, label, color, positive_only=False):
+    y = avg_df["Average_dF_F0"].to_numpy()
+    if positive_only:
+        y = np.maximum(y, 0)
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=avg_df["Time"], y=avg_df["Average_dF_F0"], mode="lines", name=label, line=dict(color=color, width=3)))
-    upper = avg_df["Average_dF_F0"] + sem_df["SEM"]
-    lower = avg_df["Average_dF_F0"] - sem_df["SEM"]
-    fig.add_trace(go.Scatter(x=avg_df["Time"], y=upper, mode="lines", name=f"{label} + SEM", line=dict(color=color, width=0), showlegend=False))
-    fig.add_trace(go.Scatter(x=avg_df["Time"], y=lower, mode="lines", name=f"{label} - SEM", line=dict(color=color, width=0), fill="tonexty", fillcolor=f"rgba({int(color[1:3],16)}, {int(color[3:5],16)}, {int(color[5:7],16)}, 0.2)", showlegend=False))
-    fig.update_layout(height=420, xaxis_title="Time", yaxis_title="Average ΔF/F0", template="plotly_white")
+    fig.add_trace(
+        go.Scatter(
+            x=avg_df["Time"],
+            y=y,
+            mode="lines",
+            name=label,
+            line=dict(color=color, width=3)
+        )
+    )
+    sem = sem_df["SEM"].to_numpy()
+    if positive_only:
+        upper = np.maximum(y + sem, 0)
+        lower = np.maximum(y - sem, 0)
+    else:
+        upper = y + sem
+        lower = y - sem
+    fig.add_trace(
+        go.Scatter(
+            x=avg_df["Time"],
+            y=upper,
+            mode="lines",
+            name=f"{label} + SEM",
+            line=dict(color=color, width=0),
+            showlegend=False
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=avg_df["Time"],
+            y=lower,
+            mode="lines",
+            name=f"{label} - SEM",
+            line=dict(color=color, width=0),
+            fill="tonexty",
+            fillcolor=f"rgba({int(color[1:3],16)}, {int(color[3:5],16)}, {int(color[5:7],16)}, 0.2)",
+            showlegend=False
+        )
+    )
+    fig.update_layout(
+        height=420,
+        xaxis_title="Time",
+        yaxis_title="Average ΔF/F0",
+        template="plotly_white"
+    )
     return fig
 
 
-def build_overlay_plot_with_sem(control_avg, treatment_avg, control_sem, treatment_sem):
+def build_overlay_plot_with_sem(
+    control_avg, treatment_avg, control_sem, treatment_sem, positive_only=False
+):
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=control_avg["Time"], y=control_avg["Average_dF_F0"], mode="lines", name="Control", line=dict(color="#1f77b4", width=3)))
-    fig.add_trace(go.Scatter(x=treatment_avg["Time"], y=treatment_avg["Average_dF_F0"], mode="lines", name="Treatment", line=dict(color="#d62728", width=3)))
-    ctrl_upper = control_avg["Average_dF_F0"] + control_sem["SEM"]
-    ctrl_lower = control_avg["Average_dF_F0"] - control_sem["SEM"]
-    fig.add_trace(go.Scatter(x=control_avg["Time"], y=ctrl_upper, mode="lines", name="Control + SEM", line=dict(color="#1f77b4", width=0), showlegend=False))
-    fig.add_trace(go.Scatter(x=control_avg["Time"], y=ctrl_lower, mode="lines", name="Control - SEM", line=dict(color="#1f77b4", width=0), fill="tonexty", fillcolor="rgba(31,119,180,0.2)", showlegend=False))
-    trt_upper = treatment_avg["Average_dF_F0"] + treatment_sem["SEM"]
-    trt_lower = treatment_avg["Average_dF_F0"] - treatment_sem["SEM"]
-    fig.add_trace(go.Scatter(x=treatment_avg["Time"], y=trt_upper, mode="lines", name="Treatment + SEM", line=dict(color="#d62728", width=0), showlegend=False))
-    fig.add_trace(go.Scatter(x=treatment_avg["Time"], y=trt_lower, mode="lines", name="Treatment - SEM", line=dict(color="#d62728", width=0), fill="tonexty", fillcolor="rgba(214,39,40,0.2)", showlegend=False))
-    fig.update_layout(height=480, xaxis_title="Time", yaxis_title="Average ΔF/F0", template="plotly_white")
+
+    y_ctrl = control_avg["Average_dF_F0"].to_numpy()
+    y_trt = treatment_avg["Average_dF_F0"].to_numpy()
+    if positive_only:
+        y_ctrl = np.maximum(y_ctrl, 0)
+        y_trt = np.maximum(y_trt, 0)
+
+    fig.add_trace(
+        go.Scatter(
+            x=control_avg["Time"],
+            y=y_ctrl,
+            mode="lines",
+            name="Control",
+            line=dict(color="#1f77b4", width=3)
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=treatment_avg["Time"],
+            y=y_trt,
+            mode="lines",
+            name="Treatment",
+            line=dict(color="#d62728", width=3)
+        )
+    )
+
+    sem_ctrl = control_sem["SEM"].to_numpy()
+    sem_trt = treatment_sem["SEM"].to_numpy()
+    if positive_only:
+        ctrl_upper = np.maximum(y_ctrl + sem_ctrl, 0)
+        ctrl_lower = np.maximum(y_ctrl - sem_ctrl, 0)
+        trt_upper = np.maximum(y_trt + sem_trt, 0)
+        trt_lower = np.maximum(y_trt - sem_trt, 0)
+    else:
+        ctrl_upper = y_ctrl + sem_ctrl
+        ctrl_lower = y_ctrl - sem_ctrl
+        trt_upper = y_trt + sem_trt
+        trt_lower = y_trt - sem_trt
+
+    fig.add_trace(
+        go.Scatter(
+            x=control_avg["Time"],
+            y=ctrl_upper,
+            mode="lines",
+            name="Control + SEM",
+            line=dict(color="#1f77b4", width=0),
+            showlegend=False
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=control_avg["Time"],
+            y=ctrl_lower,
+            mode="lines",
+            name="Control - SEM",
+            line=dict(color="#1f77b4", width=0),
+            fill="tonexty",
+            fillcolor="rgba(31,119,180,0.2)",
+            showlegend=False
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=treatment_avg["Time"],
+            y=trt_upper,
+            mode="lines",
+            name="Treatment + SEM",
+            line=dict(color="#d62728", width=0),
+            showlegend=False
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=treatment_avg["Time"],
+            y=trt_lower,
+            mode="lines",
+            name="Treatment - SEM",
+            line=dict(color="#d62728", width=0),
+            fill="tonexty",
+            fillcolor="rgba(214,39,40,0.2)",
+            showlegend=False
+        )
+    )
+
+    fig.update_layout(
+        height=480,
+        xaxis_title="Time",
+        yaxis_title="Average ΔF/F0",
+        template="plotly_white"
+    )
     return fig
 
 
 def metrics_table(control_summary, treatment_summary):
     rows = []
-    metrics = ["Peak", "Fade A", "Fade B", "Fade C", "AUC whole", "AUC above baseline", "First below zero"]
+    metrics = [
+        "Peak", "Fade A", "Fade B", "Fade C",
+        "AUC whole", "AUC above baseline", "First below zero",
+        "Intake rate", "Release rate"
+    ]
     for cond, summary in [("Control", control_summary), ("Treatment", treatment_summary)]:
         for metric_name in metrics:
             if metric_name == "Peak":
-                rows.append({"Condition": cond, "Metric": metric_name, "X_time": summary.get("Peak time", np.nan), "Y_value": summary.get("Peak value", np.nan)})
+                rows.append({
+                    "Condition": cond,
+                    "Metric": metric_name,
+                    "X_time": summary.get("Peak time", np.nan),
+                    "Y_value": summary.get("Peak value", np.nan)
+                })
             elif metric_name == "AUC whole":
-                rows.append({"Condition": cond, "Metric": metric_name, "X_time": np.nan, "Y_value": summary.get("AUC whole", np.nan)})
+                rows.append({
+                    "Condition": cond,
+                    "Metric": metric_name,
+                    "X_time": np.nan,
+                    "Y_value": summary.get("AUC whole", np.nan)
+                })
             elif metric_name == "AUC above baseline":
-                rows.append({"Condition": cond, "Metric": metric_name, "X_time": np.nan, "Y_value": summary.get("AUC above baseline", np.nan)})
+                rows.append({
+                    "Condition": cond,
+                    "Metric": metric_name,
+                    "X_time": np.nan,
+                    "Y_value": summary.get("AUC above baseline", np.nan)
+                })
             elif metric_name == "First below zero":
-                rows.append({"Condition": cond, "Metric": metric_name, "X_time": summary.get("First below zero", np.nan), "Y_value": np.nan})
+                rows.append({
+                    "Condition": cond,
+                    "Metric": metric_name,
+                    "X_time": summary.get("First below zero", np.nan),
+                    "Y_value": np.nan
+                })
+            elif metric_name == "Intake rate":
+                rows.append({
+                    "Condition": cond,
+                    "Metric": metric_name,
+                    "X_time": np.nan,
+                    "Y_value": summary.get("Intake rate", np.nan)
+                })
+            elif metric_name == "Release rate":
+                rows.append({
+                    "Condition": cond,
+                    "Metric": metric_name,
+                    "X_time": np.nan,
+                    "Y_value": summary.get("Release rate", np.nan)
+                })
             else:
-                rows.append({"Condition": cond, "Metric": metric_name, "X_time": summary.get(f"{metric_name} time", np.nan), "Y_value": summary.get(f"{metric_name} value", np.nan)})
+                rows.append({
+                    "Condition": cond,
+                    "Metric": metric_name,
+                    "X_time": summary.get(f"{metric_name} time", np.nan),
+                    "Y_value": summary.get(f"{metric_name} value", np.nan)
+                })
     return pd.DataFrame(rows)
 
 
@@ -208,9 +447,17 @@ def csv_bytes(df):
 
 col1, col2 = st.columns(2)
 with col1:
-    control_file = st.file_uploader("Upload control file", type=["csv", "xlsx", "xls"], key=f"control_{st.session_state.uploader_token}")
+    control_file = st.file_uploader(
+        "Upload control file",
+        type=["csv", "xlsx", "xls"],
+        key=f"control_{st.session_state.uploader_token}"
+    )
 with col2:
-    treatment_file = st.file_uploader("Upload treatment file", type=["csv", "xlsx", "xls"], key=f"treatment_{st.session_state.uploader_token}")
+    treatment_file = st.file_uploader(
+        "Upload treatment file",
+        type=["csv", "xlsx", "xls"],
+        key=f"treatment_{st.session_state.uploader_token}"
+    )
 
 if control_file and treatment_file:
     control_df = read_table(control_file)
@@ -219,15 +466,39 @@ if control_file and treatment_file:
     st.subheader("Column selection")
     c1, c2 = st.columns(2)
     with c1:
-        control_time_col = st.selectbox("Control time column", control_df.columns.tolist(), key="control_time_col")
-        control_cell_cols = st.multiselect("Control cell columns", [c for c in control_df.columns if c != control_time_col], default=[c for c in control_df.columns if c != control_time_col], key="control_cell_cols")
+        control_time_col = st.selectbox(
+            "Control time column",
+            control_df.columns.tolist(),
+            key="control_time_col"
+        )
+        control_cell_cols = st.multiselect(
+            "Control cell columns",
+            [c for c in control_df.columns if c != control_time_col],
+            default=[c for c in control_df.columns if c != control_time_col],
+            key="control_cell_cols"
+        )
     with c2:
-        treatment_time_col = st.selectbox("Treatment time column", treatment_df.columns.tolist(), key="treatment_time_col")
-        treatment_cell_cols = st.multiselect("Treatment cell columns", [c for c in treatment_df.columns if c != treatment_time_col], default=[c for c in treatment_df.columns if c != treatment_time_col], key="treatment_cell_cols")
+        treatment_time_col = st.selectbox(
+            "Treatment time column",
+            treatment_df.columns.tolist(),
+            key="treatment_time_col"
+        )
+        treatment_cell_cols = st.multiselect(
+            "Treatment cell columns",
+            [c for c in treatment_df.columns if c != treatment_time_col],
+            default=[c for c in treatment_df.columns if c != treatment_time_col],
+            key="treatment_cell_cols"
+        )
 
     if control_cell_cols and treatment_cell_cols:
-        control_dff = compute_dff(control_df, control_time_col, control_cell_cols, f0_mode, int(f0_n))
-        treatment_dff = compute_dff(treatment_df, treatment_time_col, treatment_cell_cols, f0_mode, int(f0_n))
+        control_dff = compute_dff(
+            control_df, control_time_col, control_cell_cols,
+            f0_mode, int(f0_n)
+        )
+        treatment_dff = compute_dff(
+            treatment_df, treatment_time_col, treatment_cell_cols,
+            f0_mode, int(f0_n)
+        )
 
         control_avg = make_avg_trace(control_dff)
         treatment_avg = make_avg_trace(treatment_dff)
@@ -236,48 +507,125 @@ if control_file and treatment_file:
         treatment_summary = summarize_average_trace(treatment_avg)
         metric_df = metrics_table(control_summary, treatment_summary)
 
-        sem_control = control_dff[control_cell_cols].apply(lambda col: col.std(ddof=1) / np.sqrt(len(col)), axis=1)
+        sem_control = control_dff[control_cell_cols].apply(
+            lambda col: col.std(ddof=1) / np.sqrt(len(col)), axis=1
+        )
         sem_control = pd.DataFrame({"Time": control_dff["Time"], "SEM": sem_control})
-        sem_treatment = treatment_dff[treatment_cell_cols].apply(lambda col: col.std(ddof=1) / np.sqrt(len(col)), axis=1)
+        sem_treatment = treatment_dff[treatment_cell_cols].apply(
+            lambda col: col.std(ddof=1) / np.sqrt(len(col)), axis=1
+        )
         sem_treatment = pd.DataFrame({"Time": treatment_dff["Time"], "SEM": sem_treatment})
 
         if add_stats:
             st.subheader("Average trace: Control (with SEM)")
-            fig_control = build_single_plot_with_sem(control_avg, sem_control, "Control", "#1f77b4")
+            fig_control = build_single_plot_with_sem(
+                control_avg, sem_control, "Control", "#1f77b4",
+                positive_only=plot_positive_only
+            )
             st.plotly_chart(fig_control, use_container_width=True)
+
             st.subheader("Average trace: Treatment (with SEM)")
-            fig_treatment = build_single_plot_with_sem(treatment_avg, sem_treatment, "Treatment", "#d62728")
+            fig_treatment = build_single_plot_with_sem(
+                treatment_avg, sem_treatment, "Treatment", "#d62728",
+                positive_only=plot_positive_only
+            )
             st.plotly_chart(fig_treatment, use_container_width=True)
+
             st.subheader("Overlay: Control vs Treatment (with SEM)")
-            fig_overlay = build_overlay_plot_with_sem(control_avg, treatment_avg, sem_control, sem_treatment)
+            fig_overlay = build_overlay_plot_with_sem(
+                control_avg, treatment_avg, sem_control, sem_treatment,
+                positive_only=plot_positive_only
+            )
             st.plotly_chart(fig_overlay, use_container_width=True)
         else:
             st.subheader("Average trace: Control")
             fig_control = go.Figure()
-            fig_control.add_trace(go.Scatter(x=control_avg["Time"], y=control_avg["Average_dF_F0"], mode="lines", name="Control", line=dict(color="#1f77b4", width=3)))
-            fig_control.update_layout(height=420, xaxis_title="Time", yaxis_title="Average ΔF/F0", template="plotly_white")
+            y_ctrl = control_avg["Average_dF_F0"].to_numpy()
+            if plot_positive_only:
+                y_ctrl = np.maximum(y_ctrl, 0)
+            fig_control.add_trace(
+                go.Scatter(
+                    x=control_avg["Time"],
+                    y=y_ctrl,
+                    mode="lines",
+                    name="Control",
+                    line=dict(color="#1f77b4", width=3)
+                )
+            )
+            fig_control.update_layout(
+                height=420,
+                xaxis_title="Time",
+                yaxis_title="Average ΔF/F0",
+                template="plotly_white"
+            )
             st.plotly_chart(fig_control, use_container_width=True)
+
             st.subheader("Average trace: Treatment")
             fig_treatment = go.Figure()
-            fig_treatment.add_trace(go.Scatter(x=treatment_avg["Time"], y=treatment_avg["Average_dF_F0"], mode="lines", name="Treatment", line=dict(color="#d62728", width=3)))
-            fig_treatment.update_layout(height=420, xaxis_title="Time", yaxis_title="Average ΔF/F0", template="plotly_white")
+            y_trt = treatment_avg["Average_dF_F0"].to_numpy()
+            if plot_positive_only:
+                y_trt = np.maximum(y_trt, 0)
+            fig_treatment.add_trace(
+                go.Scatter(
+                    x=treatment_avg["Time"],
+                    y=y_trt,
+                    mode="lines",
+                    name="Treatment",
+                    line=dict(color="#d62728", width=3)
+                )
+            )
+            fig_treatment.update_layout(
+                height=420,
+                xaxis_title="Time",
+                yaxis_title="Average ΔF/F0",
+                template="plotly_white"
+            )
             st.plotly_chart(fig_treatment, use_container_width=True)
+
             st.subheader("Overlay: Control vs Treatment")
             fig_overlay = go.Figure()
-            fig_overlay.add_trace(go.Scatter(x=control_avg["Time"], y=control_avg["Average_dF_F0"], mode="lines", name="Control", line=dict(color="#1f77b4", width=3)))
-            fig_overlay.add_trace(go.Scatter(x=treatment_avg["Time"], y=treatment_avg["Average_dF_F0"], mode="lines", name="Treatment", line=dict(color="#d62728", width=3)))
-            fig_overlay.update_layout(height=480, xaxis_title="Time", yaxis_title="Average ΔF/F0", template="plotly_white")
+            y_ctrl_ov = control_avg["Average_dF_F0"].to_numpy()
+            y_trt_ov = treatment_avg["Average_dF_F0"].to_numpy()
+            if plot_positive_only:
+                y_ctrl_ov = np.maximum(y_ctrl_ov, 0)
+                y_trt_ov = np.maximum(y_trt_ov, 0)
+            fig_overlay.add_trace(
+                go.Scatter(
+                    x=control_avg["Time"],
+                    y=y_ctrl_ov,
+                    mode="lines",
+                    name="Control",
+                    line=dict(color="#1f77b4", width=3)
+                )
+            )
+            fig_overlay.add_trace(
+                go.Scatter(
+                    x=treatment_avg["Time"],
+                    y=y_trt_ov,
+                    mode="lines",
+                    name="Treatment",
+                    line=dict(color="#d62728", width=3)
+                )
+            )
+            fig_overlay.update_layout(
+                height=480,
+                xaxis_title="Time",
+                yaxis_title="Average ΔF/F0",
+                template="plotly_white"
+            )
             st.plotly_chart(fig_overlay, use_container_width=True)
 
-        st.subheader("Peak, fade, and AUC table")
+        st.subheader("Peak, fade, AUC, and rate metrics")
         st.write("**Fade definitions:**")
         st.markdown(
-            "- **Fade A**: first time point after the peak where the average trace decreases.\\n"
-            "- **Fade B**: first time point after the peak where the average trace reaches 50% of peak.\\n"
-            "- **Fade C**: first time point after the peak where the average trace reaches 0 or below.\\n"
-            "- **AUC whole**: area under the full curve, signed, using trapezoidal integration.\\n"
-            "- **AUC above baseline**: area above zero only, calculated by integrating \(\max(y, 0)\).\\n"
-            "- **First below zero**: first time point where the average trace becomes negative."
+            "- **Fade A**: first time point after the peak where the average trace decreases.\n"
+            "- **Fade B**: first time point after the peak where the average trace reaches 50% of peak.\n"
+            "- **Fade C**: first time point after the peak where the average trace reaches 0 or below.\n"
+            "- **AUC whole**: area under the full curve, signed, using trapezoidal integration.\n"
+            "- **AUC above baseline**: area above zero only, calculated by integrating \\(\\max(y, 0)\\).\n"
+            "- **First below zero**: first time point where the average trace becomes negative.\n"
+            "- **Intake rate**: slope (ΔF/F0 per unit time) from the baseline (zero or first point) before the peak up to the peak.\n"
+            "- **Release rate**: slope from the peak down to the baseline (zero or last point) after the peak."
         )
         st.dataframe(metric_df, use_container_width=True)
 
@@ -287,36 +635,85 @@ if control_file and treatment_file:
             trt_peak_vals = treatment_dff[treatment_cell_cols].max().dropna()
             if len(ctrl_peak_vals) > 1 and len(trt_peak_vals) > 1:
                 try:
-                    t_stat, p_val = stats.ttest_ind(ctrl_peak_vals, trt_peak_vals, equal_var=False)
+                    t_stat, p_val = stats.ttest_ind(
+                        ctrl_peak_vals, trt_peak_vals, equal_var=False
+                    )
                 except Exception:
                     t_stat, p_val = np.nan, np.nan
-                st.write(f"Peak value comparison (Welch's t-test): t = {t_stat:.3f}, p = {p_val:.4f}")
+                st.write(
+                    f"Peak value comparison (Welch's t-test): "
+                    f"t = {t_stat:.3f}, p = {p_val:.4f}"
+                )
             else:
                 st.write("Not enough cells to compute a meaningful peak-value comparison.")
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        excel_data = to_excel_bytes(control_dff, treatment_dff, control_avg, treatment_avg, metric_df)
+        excel_data = to_excel_bytes(
+            control_dff, treatment_dff, control_avg, treatment_avg, metric_df
+        )
 
         cdl1, cdl2, cdl3, cdl4 = st.columns(4)
         with cdl1:
-            st.download_button("Download metrics CSV", data=csv_bytes(metric_df), file_name=f"metrics_{ts}.csv", mime="text/csv", use_container_width=True)
+            st.download_button(
+                "Download metrics CSV",
+                data=csv_bytes(metric_df),
+                file_name=f"metrics_{ts}.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
         with cdl2:
-            st.download_button("Download control avg CSV", data=csv_bytes(control_avg), file_name=f"control_average_{ts}.csv", mime="text/csv", use_container_width=True)
+            st.download_button(
+                "Download control avg CSV",
+                data=csv_bytes(control_avg),
+                file_name=f"control_average_{ts}.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
         with cdl3:
-            st.download_button("Download treatment avg CSV", data=csv_bytes(treatment_avg), file_name=f"treatment_average_{ts}.csv", mime="text/csv", use_container_width=True)
+            st.download_button(
+                "Download treatment avg CSV",
+                data=csv_bytes(treatment_avg),
+                file_name=f"treatment_average_{ts}.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
         with cdl4:
-            st.download_button("Download Excel workbook", data=excel_data, file_name=f"calcium_analysis_{ts}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+            st.download_button(
+                "Download Excel workbook",
+                data=excel_data,
+                file_name=f"calcium_analysis_{ts}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
 
         html_control = fig_control.to_html(include_plotlyjs='cdn')
         html_treatment = fig_treatment.to_html(include_plotlyjs='cdn')
         html_overlay = fig_overlay.to_html(include_plotlyjs='cdn')
         g1, g2, g3 = st.columns(3)
         with g1:
-            st.download_button("Download control graph HTML", data=html_control, file_name=f"control_graph_{ts}.html", mime="text/html", use_container_width=True)
+            st.download_button(
+                "Download control graph HTML",
+                data=html_control,
+                file_name=f"control_graph_{ts}.html",
+                mime="text/html",
+                use_container_width=True
+            )
         with g2:
-            st.download_button("Download treatment graph HTML", data=html_treatment, file_name=f"treatment_graph_{ts}.html", mime="text/html", use_container_width=True)
+            st.download_button(
+                "Download treatment graph HTML",
+                data=html_treatment,
+                file_name=f"treatment_graph_{ts}.html",
+                mime="text/html",
+                use_container_width=True
+            )
         with g3:
-            st.download_button("Download overlay graph HTML", data=html_overlay, file_name=f"overlay_graph_{ts}.html", mime="text/html", use_container_width=True)
+            st.download_button(
+                "Download overlay graph HTML",
+                data=html_overlay,
+                file_name=f"overlay_graph_{ts}.html",
+                mime="text/html",
+                use_container_width=True
+            )
     else:
         st.warning("Please select at least one cell column for each condition.")
 else:
