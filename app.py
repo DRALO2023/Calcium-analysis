@@ -9,7 +9,7 @@ import streamlit as st
 
 
 # ============================================================
-# App setup and persistent session state
+# App setup
 # ============================================================
 
 st.set_page_config(
@@ -20,14 +20,15 @@ st.set_page_config(
 st.title("Calcium Imaging Post-Analysis")
 st.caption(
     "Manual P1–P4 calcium-event curation with multi-file ROI detection, "
-    "background correction, and ΔF/F0 normalization."
+    "background correction, ΔF/F0 normalization, and multiple manually "
+    "defined stimulation events per trace."
 )
 
 if "uploader_token" not in st.session_state:
     st.session_state.uploader_token = 0
 
-if "manual_events" not in st.session_state:
-    st.session_state.manual_events = {}
+if "trace_events" not in st.session_state:
+    st.session_state.trace_events = {}
 
 if "current_points" not in st.session_state:
     st.session_state.current_points = {}
@@ -35,26 +36,31 @@ if "current_points" not in st.session_state:
 
 def reset_analysis():
     """
-    Clear uploaded-file widgets, stored manual events, and temporary points.
+    Reset file upload, current selections, and saved manual events.
     """
-    token = st.session_state.get("uploader_token", 0) + 1
+    next_token = st.session_state.get(
+        "uploader_token",
+        0,
+    ) + 1
 
     st.session_state.clear()
 
-    st.session_state.uploader_token = token
-    st.session_state.manual_events = {}
+    st.session_state.uploader_token = next_token
+    st.session_state.trace_events = {}
     st.session_state.current_points = {}
 
 
 # ============================================================
-# Input and column detection
+# File reading and column detection
 # ============================================================
 
 def read_table(uploaded_file):
     """
-    Read a CSV or Excel file.
+    Read CSV, XLSX, or XLS uploaded file.
     """
-    if uploaded_file.name.lower().endswith(".csv"):
+    filename = uploaded_file.name.lower()
+
+    if filename.endswith(".csv"):
         return pd.read_csv(uploaded_file)
 
     return pd.read_excel(uploaded_file)
@@ -62,7 +68,7 @@ def read_table(uploaded_file):
 
 def clean_name(value):
     """
-    Normalize a column name for automatic matching.
+    Normalize column names for automatic matching.
     """
     return re.sub(
         r"[^a-z0-9]",
@@ -73,15 +79,13 @@ def clean_name(value):
 
 def detect_columns(df):
     """
-    Detect likely Label, background, cellular Mean ROI, Area, and time columns.
+    Identify likely Label, time, background, Mean ROI, and Area columns.
 
-    Cellular ROI traces:
+    Cell ROI signals must match:
         Mean1, Mean2, Mean3, ..., MeanN
 
-    Background:
-        Mean(background), Mean Background, background mean, etc.
-
-    Area columns are retained as metadata, not used as fluorescence signals.
+    Background can match:
+        Mean(background), Mean Background, Background Mean, etc.
     """
     columns = list(df.columns)
 
@@ -193,7 +197,7 @@ def detect_columns(df):
 
 def first_valid(series):
     """
-    Return the first non-missing value.
+    Return the first nonmissing value in a series.
     """
     values = series.dropna()
 
@@ -204,18 +208,12 @@ def first_valid(series):
 
 
 # ============================================================
-# Time, background, and ΔF/F0 calculations
+# Time and fluorescence calculations
 # ============================================================
 
-def make_time(df, time_column, interval):
+def make_time(df, time_column, frame_interval):
     """
-    Convert image/frame number to elapsed time.
-
-    If a time/frame column is selected:
-        elapsed time = (frame - first frame) × interval
-
-    Otherwise:
-        row index is used as the frame number.
+    Make frame and elapsed-time vectors.
     """
     if (
         time_column is not None
@@ -243,67 +241,70 @@ def make_time(df, time_column, interval):
 
     elapsed_time = (
         frames - frames.iloc[0]
-    ) * interval
+    ) * frame_interval
 
     return frames, elapsed_time
 
 
 def calculate_f0(signal, time, settings):
     """
-    Calculate baseline F0 from a corrected fluorescence trace.
+    Calculate F0 from the corrected fluorescence trace.
     """
     signal = pd.to_numeric(
         signal,
         errors="coerce",
     )
 
-    valid = signal.dropna()
+    valid_values = signal.dropna()
 
-    if valid.empty:
+    if valid_values.empty:
         return np.nan
 
     mode = settings["f0_mode"]
 
     if mode == "First valid value":
-        return float(valid.iloc[0])
+        return float(valid_values.iloc[0])
 
     if mode == "Mean of first N valid rows":
         return float(
-            valid.iloc[
+            valid_values.iloc[
                 :max(1, settings["f0_n"])
             ].mean()
         )
 
     if mode == "Minimum value in trace":
-        return float(valid.min())
+        return float(valid_values.min())
 
     if mode == "Lower quartile (25th percentile)":
-        return float(valid.quantile(0.25))
+        return float(
+            valid_values.quantile(0.25)
+        )
 
     if mode == "Mean within baseline-time window":
-        selected_values = signal[
-            (time >= settings["baseline_start"])
-            & (time <= settings["baseline_end"])
+        values = signal[
+            (
+                time >= settings["baseline_start"]
+            )
+            & (
+                time <= settings["baseline_end"]
+            )
         ].dropna()
 
-        if selected_values.empty:
+        if values.empty:
             return np.nan
 
-        return float(selected_values.mean())
+        return float(values.mean())
 
-    return float(valid.iloc[0])
+    return float(valid_values.iloc[0])
 
 
 def make_dff(raw, background, time, settings):
     """
-    Background-correct a fluorescence trace and calculate ΔF/F0.
+    Calculate corrected fluorescence and ΔF/F0.
 
-    Default:
+    Recommended default:
         F corrected = F ROI - F background
-
         ΔF/F0 = (F corrected - F0) / F0
-
-    Negative corrected values are retained by default.
     """
     raw = pd.to_numeric(
         raw,
@@ -369,7 +370,7 @@ def make_dff(raw, background, time, settings):
 
 def auc_positive(time, values):
     """
-    Calculate positive AUC only.
+    Calculate AUC above zero.
     """
     x = np.asarray(time, dtype=float)
     y = np.asarray(values, dtype=float)
@@ -401,12 +402,12 @@ def auc_positive(time, values):
 
 
 # ============================================================
-# File processing
+# Process each uploaded file
 # ============================================================
 
 def process_file(df, filename, settings):
     """
-    Process all automatically detected Mean1...MeanN traces in one file.
+    Process every Mean1...MeanN ROI signal in a single file.
     """
     detected = detect_columns(df)
 
@@ -434,10 +435,7 @@ def process_file(df, filename, settings):
             filename,
         )
 
-    if (
-        not label
-        or label.lower() == "nan"
-    ):
+    if not label or label.lower() == "nan":
         label = re.sub(
             r"\.[^.]+$",
             "",
@@ -577,56 +575,107 @@ def process_file(df, filename, settings):
 
 
 # ============================================================
-# Manual four-point event functions
+# Manual event state and point selection
 # ============================================================
 
-def event_key(filename, trace):
+def trace_key(filename, trace):
     """
-    Unique state key for one file and one selected trace.
+    Unique session key for a selected file and trace.
     """
     return f"{filename}::{trace}"
 
 
-def init_event_state(key):
+def empty_points():
     """
-    Create persistent session-state containers for this trace.
+    Empty P1-P4 selection.
     """
-    if key not in st.session_state.manual_events:
-        st.session_state.manual_events[key] = []
-
-    if key not in st.session_state.current_points:
-        st.session_state.current_points[key] = {
-            "p1": None,
-            "p2": None,
-            "p3": None,
-            "p4": None,
-        }
+    return {
+        "p1": None,
+        "p2": None,
+        "p3": None,
+        "p4": None,
+    }
 
 
-def point_from_frame(df, trace, frame):
+def initialize_trace_events(
+    key,
+    number_of_events,
+):
     """
-    Return frame/time/value metadata for one manually selected graph point.
+    Create exactly the requested number of manual event slots.
+
+    Existing event point selections are retained where possible
+    when the number of events increases.
+    """
+    if key not in st.session_state.trace_events:
+        st.session_state.trace_events[key] = {}
+
+    stored_events = st.session_state.trace_events[key]
+
+    # Add missing event slots.
+    for event_number in range(
+        1,
+        number_of_events + 1,
+    ):
+        event_id = f"E{event_number}"
+
+        if event_id not in stored_events:
+            stored_events[event_id] = {
+                "p1": None,
+                "p2": None,
+                "p3": None,
+                "p4": None,
+                "endpoint_type": "Post-peak trough",
+                "notes": "",
+            }
+
+    # Remove event slots beyond the currently selected count.
+    valid_event_ids = {
+        f"E{event_number}"
+        for event_number in range(
+            1,
+            number_of_events + 1,
+        )
+    }
+
+    event_ids_to_remove = [
+        event_id
+        for event_id in stored_events
+        if event_id not in valid_event_ids
+    ]
+
+    for event_id in event_ids_to_remove:
+        del stored_events[event_id]
+
+
+def point_from_frame(
+    df,
+    trace,
+    frame,
+):
+    """
+    Convert one graph-selected frame into frame/time/ΔF/F0 metadata.
     """
     if frame is None:
         return None
 
-    frame_values = pd.to_numeric(
+    numeric_frames = pd.to_numeric(
         df["Frame"],
         errors="coerce",
     )
 
-    matched = df[
+    matching_rows = df[
         np.isclose(
-            frame_values,
+            numeric_frames,
             float(frame),
             equal_nan=False,
         )
     ]
 
-    if matched.empty:
+    if matching_rows.empty:
         return None
 
-    row = matched.iloc[0]
+    row = matching_rows.iloc[0]
 
     value = row[trace]
 
@@ -642,25 +691,31 @@ def point_from_frame(df, trace, frame):
 
 def add_segment(
     fig,
-    p_left,
-    p_right,
+    left_point,
+    right_point,
     color,
     dash,
-    text_left,
-    text_right,
+    left_text,
+    right_text,
 ):
     """
-    Draw a selected rate segment between two points.
+    Add one P1-P2, P2-P3, or P3-P4 segment to a Plotly graph.
     """
+    if (
+        left_point is None
+        or right_point is None
+    ):
+        return
+
     fig.add_trace(
         go.Scatter(
             x=[
-                p_left["time"],
-                p_right["time"],
+                left_point["time"],
+                right_point["time"],
             ],
             y=[
-                p_left["value"],
-                p_right["value"],
+                left_point["value"],
+                right_point["value"],
             ],
             mode="lines+markers+text",
             line=dict(
@@ -673,8 +728,8 @@ def add_segment(
                 size=11,
             ),
             text=[
-                text_left,
-                text_right,
+                left_text,
+                right_text,
             ],
             textposition="top center",
             showlegend=False,
@@ -682,17 +737,18 @@ def add_segment(
     )
 
 
-def manual_figure(
+def build_manual_figure(
     df,
     trace,
     result,
-    current,
-    saved,
+    all_events,
+    active_event_id,
     positive_only,
-    unit,
+    time_unit,
 ):
     """
-    Create an interactive trace graph showing saved and current P1-P4 points.
+    Show full trace, all saved/partially selected events,
+    and highlight the currently active event.
     """
     y = df[trace].to_numpy(dtype=float)
 
@@ -728,248 +784,325 @@ def manual_figure(
         )
     )
 
-    # Show all saved events for this selected trace.
-    for event in saved:
-        add_segment(
-            fig,
-            event["p1"],
-            event["p2"],
-            "green",
-            "solid",
-            f"{event['id']} P1",
-            f"{event['id']} P2",
-        )
-
-        add_segment(
-            fig,
-            event["p2"],
-            event["p3"],
-            "orange",
-            "dot",
-            f"{event['id']} P2",
-            f"{event['id']} P3",
-        )
-
-        add_segment(
-            fig,
-            event["p3"],
-            event["p4"],
-            "purple",
-            "dash",
-            f"{event['id']} P3",
-            f"{event['id']} P4",
-        )
-
-    point_labels = {
-        "p1": (
-            "green",
-            "P1: pre-rise low",
-        ),
-        "p2": (
-            "orange",
-            "P2: end fast rise",
-        ),
-        "p3": (
-            "red",
-            "P3: main peak",
-        ),
-        "p4": (
-            "purple",
-            "P4: post-peak end",
-        ),
+    point_colors = {
+        "p1": "green",
+        "p2": "orange",
+        "p3": "red",
+        "p4": "purple",
     }
 
-    # Show unfinished/current event points.
-    for point_name, (
-        color,
-        label,
-    ) in point_labels.items():
-        point = current.get(point_name)
+    point_labels = {
+        "p1": "P1",
+        "p2": "P2",
+        "p3": "P3",
+        "p4": "P4",
+    }
 
-        if point is None:
-            continue
+    for event_id, event in all_events.items():
+        p1 = event["p1"]
+        p2 = event["p2"]
+        p3 = event["p3"]
+        p4 = event["p4"]
 
-        fig.add_trace(
-            go.Scatter(
-                x=[point["time"]],
-                y=[point["value"]],
-                mode="markers+text",
-                marker=dict(
-                    color=color,
-                    size=15,
-                ),
-                text=[label],
-                textposition="bottom center",
-                showlegend=False,
+        opacity = 1.0 if event_id == active_event_id else 0.45
+
+        if p1 is not None and p2 is not None:
+            fig.add_trace(
+                go.Scatter(
+                    x=[
+                        p1["time"],
+                        p2["time"],
+                    ],
+                    y=[
+                        p1["value"],
+                        p2["value"],
+                    ],
+                    mode="lines+markers+text",
+                    line=dict(
+                        color=f"rgba(0,128,0,{opacity})",
+                        width=3,
+                    ),
+                    marker=dict(
+                        color="green",
+                        size=10,
+                    ),
+                    text=[
+                        f"{event_id} P1",
+                        f"{event_id} P2",
+                    ],
+                    textposition="top center",
+                    showlegend=False,
+                )
             )
-        )
 
-    p1 = current.get("p1")
-    p2 = current.get("p2")
-    p3 = current.get("p3")
-    p4 = current.get("p4")
+        if p2 is not None and p3 is not None:
+            fig.add_trace(
+                go.Scatter(
+                    x=[
+                        p2["time"],
+                        p3["time"],
+                    ],
+                    y=[
+                        p2["value"],
+                        p3["value"],
+                    ],
+                    mode="lines+markers+text",
+                    line=dict(
+                        color=f"rgba(255,165,0,{opacity})",
+                        width=2,
+                        dash="dot",
+                    ),
+                    marker=dict(
+                        color="orange",
+                        size=10,
+                    ),
+                    text=[
+                        f"{event_id} P2",
+                        f"{event_id} P3",
+                    ],
+                    textposition="bottom center",
+                    showlegend=False,
+                )
+            )
 
-    if p1 is not None and p2 is not None:
-        add_segment(
-            fig,
-            p1,
-            p2,
-            "green",
-            "solid",
-            "P1",
-            "P2",
-        )
+        if p3 is not None and p4 is not None:
+            fig.add_trace(
+                go.Scatter(
+                    x=[
+                        p3["time"],
+                        p4["time"],
+                    ],
+                    y=[
+                        p3["value"],
+                        p4["value"],
+                    ],
+                    mode="lines+markers+text",
+                    line=dict(
+                        color=f"rgba(128,0,128,{opacity})",
+                        width=3,
+                        dash="dash",
+                    ),
+                    marker=dict(
+                        color="purple",
+                        size=10,
+                    ),
+                    text=[
+                        f"{event_id} P3",
+                        f"{event_id} P4",
+                    ],
+                    textposition="top center",
+                    showlegend=False,
+                )
+            )
 
-    if p2 is not None and p3 is not None:
-        add_segment(
-            fig,
-            p2,
-            p3,
-            "orange",
-            "dot",
-            "P2",
-            "P3",
-        )
+        # Show isolated points before segment is complete.
+        for point_name in [
+            "p1",
+            "p2",
+            "p3",
+            "p4",
+        ]:
+            point = event[point_name]
 
-    if p3 is not None and p4 is not None:
-        add_segment(
-            fig,
-            p3,
-            p4,
-            "purple",
-            "dash",
-            "P3",
-            "P4",
-        )
+            if point is None:
+                continue
+
+            fig.add_trace(
+                go.Scatter(
+                    x=[point["time"]],
+                    y=[point["value"]],
+                    mode="markers+text",
+                    marker=dict(
+                        color=point_colors[point_name],
+                        size=15 if event_id == active_event_id else 10,
+                    ),
+                    text=[
+                        f"{event_id} {point_labels[point_name]}"
+                    ],
+                    textposition="bottom center",
+                    showlegend=False,
+                )
+            )
 
     fig.update_layout(
-        height=620,
+        height=650,
         template="plotly_white",
         dragmode="select",
-        xaxis_title=f"Time ({unit})",
+        xaxis_title=f"Time ({time_unit})",
         yaxis_title="ΔF/F0",
     )
 
     return fig
 
 
-def event_metrics(events):
+# ============================================================
+# Manual-event calculations
+# ============================================================
+
+def calculate_event_metrics(
+    event_id,
+    event,
+):
     """
-    Calculate P1-P4 metrics for a list of saved manual events.
+    Calculate kinetics only when all P1-P4 points are complete
+    and appear in chronological order.
+    """
+    p1 = event["p1"]
+    p2 = event["p2"]
+    p3 = event["p3"]
+    p4 = event["p4"]
+
+    if any(
+        point is None
+        for point in [
+            p1,
+            p2,
+            p3,
+            p4,
+        ]
+    ):
+        return None
+
+    if not (
+        p1["time"]
+        < p2["time"]
+        < p3["time"]
+        < p4["time"]
+    ):
+        return {
+            "Event ID": event_id,
+            "Status": (
+                "Invalid point order: require "
+                "P1 < P2 < P3 < P4"
+            ),
+        }
+
+    fast_duration = (
+        p2["time"] - p1["time"]
+    )
+
+    total_duration = (
+        p3["time"] - p1["time"]
+    )
+
+    decay_duration = (
+        p4["time"] - p3["time"]
+    )
+
+    fast_amplitude = (
+        p2["value"] - p1["value"]
+    )
+
+    total_amplitude = (
+        p3["value"] - p1["value"]
+    )
+
+    late_amplitude = (
+        p3["value"] - p2["value"]
+    )
+
+    decay_amplitude = (
+        p4["value"] - p3["value"]
+    )
+
+    fast_rate = (
+        fast_amplitude / fast_duration
+        if fast_duration > 0
+        else np.nan
+    )
+
+    overall_rate = (
+        total_amplitude / total_duration
+        if total_duration > 0
+        else np.nan
+    )
+
+    decay_rate = (
+        decay_amplitude / decay_duration
+        if decay_duration > 0
+        else np.nan
+    )
+
+    return {
+        "Event ID": event_id,
+        "Status": "Complete",
+        "P1 frame": p1["frame"],
+        "P1 time": p1["time"],
+        "P1 ΔF/F0": p1["value"],
+        "P2 frame": p2["frame"],
+        "P2 time": p2["time"],
+        "P2 ΔF/F0": p2["value"],
+        "P3 frame": p3["frame"],
+        "P3 time": p3["time"],
+        "P3 ΔF/F0": p3["value"],
+        "P4 frame": p4["frame"],
+        "P4 time": p4["time"],
+        "P4 ΔF/F0": p4["value"],
+        "Fast upstroke duration P1→P2": fast_duration,
+        "Fast upstroke amplitude P1→P2": fast_amplitude,
+        "Fast upstroke rate P1→P2": fast_rate,
+        "Time to peak P1→P3": total_duration,
+        "Peak amplitude above P1": total_amplitude,
+        "Overall rise rate P1→P3": overall_rate,
+        "Late-rise amplitude P2→P3": late_amplitude,
+        "Observed decay duration P3→P4": decay_duration,
+        "Observed decay amplitude P3→P4": decay_amplitude,
+        "Observed decay/release rate P3→P4": decay_rate,
+        "Release magnitude": (
+            -decay_rate
+            if np.isfinite(decay_rate)
+            else np.nan
+        ),
+        "P4 endpoint type": event["endpoint_type"],
+        "Notes": event["notes"],
+    }
+
+
+def build_trace_event_table(
+    event_dict,
+):
+    """
+    Build metrics table for all manually defined events on one trace.
     """
     rows = []
 
-    for event in events:
-        p1 = event["p1"]
-        p2 = event["p2"]
-        p3 = event["p3"]
-        p4 = event["p4"]
-
-        fast_duration = (
-            p2["time"] - p1["time"]
+    for event_id, event in event_dict.items():
+        row = calculate_event_metrics(
+            event_id,
+            event,
         )
 
-        total_duration = (
-            p3["time"] - p1["time"]
-        )
-
-        decay_duration = (
-            p4["time"] - p3["time"]
-        )
-
-        fast_amplitude = (
-            p2["value"] - p1["value"]
-        )
-
-        total_amplitude = (
-            p3["value"] - p1["value"]
-        )
-
-        late_amplitude = (
-            p3["value"] - p2["value"]
-        )
-
-        decay_amplitude = (
-            p4["value"] - p3["value"]
-        )
-
-        fast_rate = (
-            fast_amplitude / fast_duration
-            if fast_duration > 0
-            else np.nan
-        )
-
-        total_rate = (
-            total_amplitude / total_duration
-            if total_duration > 0
-            else np.nan
-        )
-
-        decay_rate = (
-            decay_amplitude / decay_duration
-            if decay_duration > 0
-            else np.nan
-        )
-
-        rows.append(
-            {
-                "Event ID": event["id"],
-                "P1 frame": p1["frame"],
-                "P1 time": p1["time"],
-                "P1 ΔF/F0": p1["value"],
-                "P2 frame": p2["frame"],
-                "P2 time": p2["time"],
-                "P2 ΔF/F0": p2["value"],
-                "P3 frame": p3["frame"],
-                "P3 time": p3["time"],
-                "P3 ΔF/F0": p3["value"],
-                "P4 frame": p4["frame"],
-                "P4 time": p4["time"],
-                "P4 ΔF/F0": p4["value"],
-                "Fast upstroke duration P1→P2": fast_duration,
-                "Fast upstroke amplitude P1→P2": fast_amplitude,
-                "Fast upstroke rate P1→P2": fast_rate,
-                "Time to peak P1→P3": total_duration,
-                "Peak amplitude above P1": total_amplitude,
-                "Overall rise rate P1→P3": total_rate,
-                "Late-rise amplitude P2→P3": late_amplitude,
-                "Observed decay duration P3→P4": decay_duration,
-                "Observed decay amplitude P3→P4": decay_amplitude,
-                "Observed decay/release rate P3→P4": decay_rate,
-                "Release magnitude": (
-                    -decay_rate
-                    if np.isfinite(decay_rate)
-                    else np.nan
-                ),
-                "P4 endpoint type": event["endpoint_type"],
-                "Notes": event["notes"],
-            }
-        )
+        if row is not None:
+            rows.append(row)
+        else:
+            rows.append(
+                {
+                    "Event ID": event_id,
+                    "Status": "Incomplete",
+                }
+            )
 
     return pd.DataFrame(rows)
 
 
 def build_cumulative_event_table(
-    manual_events,
+    trace_events,
     results,
 ):
     """
-    Build one table of every saved manual event from every file and trace.
-
-    This table remains populated when the user changes the selected graph.
+    Combine every complete/incomplete event from all files and traces.
     """
-    event_tables = []
-
     file_to_label = {
         result["file"]: result["label"]
         for result in results
     }
 
-    for stored_key, saved_events in manual_events.items():
-        if not saved_events:
-            continue
+    tables = []
 
-        metrics = event_metrics(saved_events)
+    for stored_key, event_dict in trace_events.items():
+        metrics = build_trace_event_table(
+            event_dict
+        )
 
         if metrics.empty:
             continue
@@ -983,11 +1116,6 @@ def build_cumulative_event_table(
             stored_file = stored_key
             stored_trace = ""
 
-        stored_label = file_to_label.get(
-            stored_file,
-            "",
-        )
-
         metrics.insert(
             0,
             "File",
@@ -997,7 +1125,10 @@ def build_cumulative_event_table(
         metrics.insert(
             1,
             "Label",
-            stored_label,
+            file_to_label.get(
+                stored_file,
+                "",
+            ),
         )
 
         metrics.insert(
@@ -1006,28 +1137,28 @@ def build_cumulative_event_table(
             stored_trace,
         )
 
-        event_tables.append(metrics)
+        tables.append(metrics)
 
-    if not event_tables:
+    if not tables:
         return pd.DataFrame()
 
     return pd.concat(
-        event_tables,
+        tables,
         ignore_index=True,
     )
 
 
 # ============================================================
-# Overview graph and export functions
+# Plotting and exports
 # ============================================================
 
 def overview_figure(
     results,
     positive_only,
-    unit,
+    time_unit,
 ):
     """
-    Plot every uploaded file as a separate average trace.
+    Plot each uploaded file separately.
     """
     palette = [
         "#1f77b4",
@@ -1043,9 +1174,9 @@ def overview_figure(
     fig = go.Figure()
 
     for index, result in enumerate(results):
-        df = result["processed"]
+        processed = result["processed"]
 
-        y = df[
+        y = processed[
             "Average dF/F0"
         ].to_numpy()
 
@@ -1054,18 +1185,18 @@ def overview_figure(
 
         fig.add_trace(
             go.Scatter(
-                x=df["Time"],
+                x=processed["Time"],
                 y=y,
                 mode="lines",
+                name=(
+                    f"{result['label']} | "
+                    f"{result['file']}"
+                ),
                 line=dict(
                     color=palette[
                         index % len(palette)
                     ],
                     width=2.5,
-                ),
-                name=(
-                    f"{result['label']} | "
-                    f"{result['file']}"
                 ),
             )
         )
@@ -1073,7 +1204,7 @@ def overview_figure(
     fig.update_layout(
         height=560,
         template="plotly_white",
-        xaxis_title=f"Time ({unit})",
+        xaxis_title=f"Time ({time_unit})",
         yaxis_title="Average ΔF/F0",
         legend_title="Uploaded file",
     )
@@ -1081,9 +1212,12 @@ def overview_figure(
     return fig
 
 
-def safe_sheet_name(name, used):
+def safe_sheet_name(
+    name,
+    used_names,
+):
     """
-    Create a unique valid Excel sheet name.
+    Create valid unique Excel sheet names.
     """
     base = re.sub(
         r"[\\/*?:\[\]]",
@@ -1094,7 +1228,7 @@ def safe_sheet_name(name, used):
     candidate = base
     counter = 1
 
-    while candidate in used:
+    while candidate in used_names:
         suffix = f"_{counter}"
 
         candidate = (
@@ -1104,7 +1238,7 @@ def safe_sheet_name(name, used):
 
         counter += 1
 
-    used.add(candidate)
+    used_names.add(candidate)
 
     return candidate
 
@@ -1116,11 +1250,10 @@ def make_workbook(
     manual_events_df,
 ):
     """
-    Create Excel workbook containing all processed traces,
-    per-ROI summary, settings, and all saved manual events.
+    Export all processed traces plus all manually curated events.
     """
     bio = io.BytesIO()
-    used = set()
+    used_names = set()
 
     with pd.ExcelWriter(
         bio,
@@ -1165,7 +1298,7 @@ def make_workbook(
         for result in results:
             sheet_name = safe_sheet_name(
                 f"trace_{result['file']}",
-                used,
+                used_names,
             )
 
             result["processed"].to_excel(
@@ -1180,7 +1313,7 @@ def make_workbook(
 
 
 # ============================================================
-# Sidebar settings
+# Sidebar
 # ============================================================
 
 with st.sidebar:
@@ -1278,7 +1411,7 @@ with st.sidebar:
 
 
 # ============================================================
-# Upload and read input
+# Upload files
 # ============================================================
 
 uploads = st.file_uploader(
@@ -1291,8 +1424,8 @@ uploads = st.file_uploader(
     accept_multiple_files=True,
     key=f"files_{st.session_state.uploader_token}",
     help=(
-        "Each file may contain a different number of ROI columns named "
-        "Mean1, Mean2, ..., MeanN."
+        "Each file may have its own number of cellular ROI columns "
+        "named Mean1, Mean2, ..., MeanN."
     ),
 )
 
@@ -1301,6 +1434,11 @@ if not uploads:
         "Upload one or more calcium CSV/XLSX files to begin."
     )
     st.stop()
+
+
+# ============================================================
+# Read files
+# ============================================================
 
 loaded = []
 
@@ -1322,17 +1460,17 @@ if not loaded:
 
 
 # ============================================================
-# Show automatic column detection
+# Detect and map columns
 # ============================================================
 
 st.subheader("Detected input structure")
 
-detected_rows = []
+detection_rows = []
 
 for item in loaded:
     detected = detect_columns(item["df"])
 
-    detected_rows.append(
+    detection_rows.append(
         {
             "File": item["file"],
             "Suggested label": detected["label"],
@@ -1348,36 +1486,31 @@ for item in loaded:
     )
 
 st.dataframe(
-    pd.DataFrame(detected_rows),
+    pd.DataFrame(detection_rows),
     use_container_width=True,
 )
 
-
-# ============================================================
-# Shared mapping
-# ============================================================
-
 first_df = loaded[0]["df"]
 first_detected = detect_columns(first_df)
-columns = list(first_df.columns)
+first_columns = list(first_df.columns)
 
 with st.expander(
     "Shared column mapping",
     expanded=True,
 ):
-    mapping_col1, mapping_col2, mapping_col3, mapping_col4 = st.columns(4)
+    column1, column2, column3, column4 = st.columns(4)
 
-    with mapping_col1:
+    with column1:
         label_options = [
             "<auto/file name>",
-        ] + columns
+        ] + first_columns
 
         label_index = (
-            columns.index(
+            first_columns.index(
                 first_detected["label"]
             )
             + 1
-            if first_detected["label"] in columns
+            if first_detected["label"] in first_columns
             else 0
         )
 
@@ -1387,17 +1520,17 @@ with st.expander(
             index=label_index,
         )
 
-    with mapping_col2:
+    with column2:
         time_options = [
             "<auto row index>",
-        ] + columns
+        ] + first_columns
 
         time_index = (
-            columns.index(
+            first_columns.index(
                 first_detected["time"]
             )
             + 1
-            if first_detected["time"] in columns
+            if first_detected["time"] in first_columns
             else 0
         )
 
@@ -1407,10 +1540,10 @@ with st.expander(
             index=time_index,
         )
 
-    with mapping_col3:
+    with column3:
         background_options = [
             "<none>",
-        ] + columns
+        ] + first_columns
 
         background_index = (
             background_options.index(
@@ -1426,10 +1559,11 @@ with st.expander(
             index=background_index,
         )
 
-    with mapping_col4:
+    with column4:
         st.info(
-            "Every file independently detects all Mean1, Mean2, ..., MeanN "
-            "ROI columns. No automatic event selection is used."
+            "Cellular signals are detected independently per file. "
+            "All Mean1, Mean2, ..., MeanN ROI columns are analyzed. "
+            "Events are selected manually."
         )
 
 
@@ -1474,7 +1608,7 @@ settings = {
 
 
 # ============================================================
-# Validate every file
+# Validate and process every file
 # ============================================================
 
 errors = []
@@ -1506,7 +1640,7 @@ for item in loaded:
         and settings["time_column"] not in df.columns
     ):
         errors.append(
-            f"{filename}: missing selected frame/time column "
+            f"{filename}: missing selected time/frame column "
             f"'{settings['time_column']}'."
         )
 
@@ -1515,7 +1649,8 @@ for item in loaded:
         and settings["label_column"] not in df.columns
     ):
         warnings.append(
-            f"{filename}: label column is absent; filename will be used."
+            f"{filename}: label column is absent; "
+            "filename will be used."
         )
 
 for warning in warnings:
@@ -1527,11 +1662,6 @@ if errors:
         + "\n".join(errors)
     )
     st.stop()
-
-
-# ============================================================
-# Process all files
-# ============================================================
 
 results = [
     process_file(
@@ -1548,7 +1678,7 @@ for result in results:
 
 
 # ============================================================
-# Overview plots and cell summary
+# Overview and summary
 # ============================================================
 
 st.subheader("All uploaded file-average traces")
@@ -1588,19 +1718,20 @@ st.dataframe(
 
 
 # ============================================================
-# Manual event curation
+# Manual event selection
 # ============================================================
 
-st.subheader("Manual four-point event selection")
+st.subheader("Manual stimulation-event selection")
 
 st.markdown(
-    "**P1:** pre-rise low point. "
-    "**P2:** end of the visually straight fast-upstroke. "
-    "**P3:** main peak. "
-    "**P4:** post-peak endpoint or trough.\n\n"
+    "For each trace, first choose the number of stimulation-response "
+    "events. Then select **P1, P2, P3, and P4** separately for each event.\n\n"
+    "- **P1:** pre-rise low point\n"
+    "- **P2:** end of visually straight fast-upstroke\n"
+    "- **P3:** main peak\n"
+    "- **P4:** post-peak endpoint/trough\n\n"
     "Fast upstroke = P1→P2; overall rise = P1→P3; "
-    "observed decay/release = P3→P4. "
-    "No point is selected automatically."
+    "observed decay/release = P3→P4."
 )
 
 selected_file = st.selectbox(
@@ -1632,18 +1763,68 @@ selected_trace = st.selectbox(
     trace_options,
 )
 
-key = event_key(
+key = trace_key(
     selected_file,
     selected_trace,
 )
 
-init_event_state(key)
+number_of_events = int(
+    st.number_input(
+        "Number of stimulation-response events in this trace",
+        min_value=1,
+        max_value=20,
+        value=1,
+        step=1,
+        help=(
+            "For example, select 3 if this trace has three ATP "
+            "stimulations/responses to analyze separately."
+        ),
+        key=f"event_count_{key}",
+    )
+)
 
-current = st.session_state.current_points[key]
-saved = st.session_state.manual_events[key]
+initialize_trace_events(
+    key,
+    number_of_events,
+)
+
+all_events = st.session_state.trace_events[key]
+
+event_options = [
+    f"E{event_number}"
+    for event_number in range(
+        1,
+        number_of_events + 1,
+    )
+]
+
+active_event_id = st.selectbox(
+    "Event/stimulation currently being curated",
+    event_options,
+    key=f"active_event_{key}",
+)
+
+active_event = all_events[active_event_id]
+
+event_label = st.text_input(
+    "Stimulation label",
+    value=active_event.get(
+        "stimulation_label",
+        active_event_id,
+    ),
+    key=f"stimulation_label_{key}_{active_event_id}",
+    help=(
+        "For example: ATP 1, ATP 2, ATP + CaCl2, "
+        "washout, or spontaneous response."
+    ),
+)
+
+all_events[active_event_id][
+    "stimulation_label"
+] = event_label
 
 next_point = st.radio(
-    "Select next point",
+    f"Select next point for {active_event_id}",
     [
         "P1: pre-rise low point",
         "P2: end of linear fast upstroke",
@@ -1651,6 +1832,7 @@ next_point = st.radio(
         "P4: post-peak endpoint / low point",
     ],
     horizontal=True,
+    key=f"next_point_{key}_{active_event_id}",
 )
 
 point_map = {
@@ -1662,24 +1844,23 @@ point_map = {
 
 st.info(
     "Use Plotly's **Select Points** tool in the graph toolbar, "
-    "then click a plotted frame marker. The app records the exact "
-    "acquired frame."
+    "then click a plotted marker. The app records the exact acquired frame."
 )
 
-figure = manual_figure(
+manual_plot = build_manual_figure(
     processed,
     selected_trace,
     selected_result,
-    current,
-    saved,
+    all_events,
+    active_event_id,
     positive_only,
     time_unit,
 )
 
 selection = st.plotly_chart(
-    figure,
+    manual_plot,
     use_container_width=True,
-    key=f"manual_{key}",
+    key=f"manual_plot_{key}",
     on_select="rerun",
     selection_mode="points",
     config={
@@ -1695,94 +1876,91 @@ if (
     and selection.selection
     and selection.selection.get("points")
 ):
-    selected = selection.selection["points"][0]
+    selected_point = selection.selection["points"][0]
 
-    chosen = point_from_frame(
-        processed,
-        selected_trace,
-        selected.get("customdata"),
+    selected_frame = selected_point.get(
+        "customdata"
     )
 
-    if chosen is not None:
-        st.session_state.current_points[key][
+    chosen_point = point_from_frame(
+        processed,
+        selected_trace,
+        selected_frame,
+    )
+
+    if chosen_point is not None:
+        all_events[active_event_id][
             point_map[next_point]
-        ] = chosen
+        ] = chosen_point
 
         st.rerun()
 
 
 # ------------------------------------------------------------
-# Manual selection controls
+# Active-event controls
 # ------------------------------------------------------------
 
-control_col1, control_col2, control_col3, control_col4 = st.columns(4)
+control1, control2, control3 = st.columns(3)
 
-with control_col1:
+with control1:
     if st.button(
-        "Undo last point",
-        key=f"undo_{key}",
+        f"Undo last point for {active_event_id}",
+        key=f"undo_{key}_{active_event_id}",
         use_container_width=True,
     ):
-        points = st.session_state.current_points[key]
-
         for point_name in [
             "p4",
             "p3",
             "p2",
             "p1",
         ]:
-            if points[point_name] is not None:
-                points[point_name] = None
+            if (
+                all_events[active_event_id][
+                    point_name
+                ]
+                is not None
+            ):
+                all_events[active_event_id][
+                    point_name
+                ] = None
                 break
 
         st.rerun()
 
-with control_col2:
+with control2:
     if st.button(
-        "Reset current event",
-        key=f"reset_current_{key}",
+        f"Reset points for {active_event_id}",
+        key=f"reset_event_{key}_{active_event_id}",
         use_container_width=True,
     ):
-        st.session_state.current_points[key] = {
-            "p1": None,
-            "p2": None,
-            "p3": None,
-            "p4": None,
-        }
+        all_events[active_event_id].update(
+            empty_points()
+        )
 
         st.rerun()
 
-with control_col3:
-    if st.button(
-        "Delete last saved event",
-        key=f"delete_{key}",
-        use_container_width=True,
-    ):
-        if st.session_state.manual_events[key]:
-            st.session_state.manual_events[key].pop()
-
-        st.rerun()
-
-with control_col4:
+with control3:
     if st.button(
         "Reset all events for this trace",
         key=f"reset_all_{key}",
         use_container_width=True,
     ):
-        st.session_state.manual_events[key] = []
+        st.session_state.trace_events[key] = {}
 
-        st.session_state.current_points[key] = {
-            "p1": None,
-            "p2": None,
-            "p3": None,
-            "p4": None,
-        }
+        initialize_trace_events(
+            key,
+            number_of_events,
+        )
 
         st.rerun()
 
 
+# ------------------------------------------------------------
+# Event annotations and current status
+# ------------------------------------------------------------
+
 endpoint_type = st.selectbox(
-    "P4 endpoint type",
+    f"P4 endpoint type for {active_event_id}",
     [
         "Post-peak trough",
         "Returned to baseline",
@@ -1791,142 +1969,91 @@ endpoint_type = st.selectbox(
         "Sustained plateau",
         "Manual endpoint",
     ],
-    key=f"endpoint_{key}",
+    index=[
+        "Post-peak trough",
+        "Returned to baseline",
+        "Before next rise",
+        "Recording end",
+        "Sustained plateau",
+        "Manual endpoint",
+    ].index(
+        all_events[active_event_id].get(
+            "endpoint_type",
+            "Post-peak trough",
+        )
+    ),
+    key=f"endpoint_{key}_{active_event_id}",
 )
+
+all_events[active_event_id][
+    "endpoint_type"
+] = endpoint_type
 
 notes = st.text_input(
-    "Notes",
-    key=f"notes_{key}",
+    f"Notes for {active_event_id}",
+    value=all_events[active_event_id].get(
+        "notes",
+        "",
+    ),
+    key=f"notes_{key}_{active_event_id}",
 )
 
-complete = all(
-    current[point_name] is not None
-    for point_name in [
-        "p1",
-        "p2",
-        "p3",
-        "p4",
-    ]
+all_events[active_event_id][
+    "notes"
+] = notes
+
+current_metric = calculate_event_metrics(
+    active_event_id,
+    all_events[active_event_id],
 )
 
-if not complete:
+if current_metric is None:
     st.caption(
-        "Current event is incomplete. "
+        f"{active_event_id} is incomplete. "
         "Select P1, P2, P3, and P4."
     )
-
-if st.button(
-    "Save current four-point event",
-    disabled=not complete,
-    key=f"save_{key}",
-    use_container_width=True,
-):
-    p1 = current["p1"]
-    p2 = current["p2"]
-    p3 = current["p3"]
-    p4 = current["p4"]
-
-    if not (
-        p1["time"]
-        < p2["time"]
-        < p3["time"]
-        < p4["time"]
-    ):
-        st.error(
-            "Points must be selected in order: "
-            "P1 before P2 before P3 before P4."
-        )
-    else:
-        event_number = (
-            len(
-                st.session_state.manual_events[key]
-            )
-            + 1
-        )
-
-        st.session_state.manual_events[key].append(
-            {
-                "id": f"E{event_number}",
-                "p1": p1,
-                "p2": p2,
-                "p3": p3,
-                "p4": p4,
-                "endpoint_type": endpoint_type,
-                "notes": notes,
-            }
-        )
-
-        # Clear only temporary unfinished points. Saved events remain.
-        st.session_state.current_points[key] = {
-            "p1": None,
-            "p2": None,
-            "p3": None,
-            "p4": None,
-        }
-
-        st.rerun()
-
-
-# ============================================================
-# Current trace event table
-# ============================================================
-
-selected_metrics = event_metrics(
-    st.session_state.manual_events[key]
-)
-
-st.subheader("Saved events for the selected trace")
-
-if selected_metrics.empty:
-    st.info(
-        "No completed four-point events have been saved for the "
-        "currently selected trace."
+elif current_metric.get("Status") == "Complete":
+    st.success(
+        f"{active_event_id} is complete and ready for export."
     )
 else:
-    selected_metrics_display = selected_metrics.copy()
-
-    selected_metrics_display.insert(
-        0,
-        "File",
-        selected_file,
-    )
-
-    selected_metrics_display.insert(
-        1,
-        "Label",
-        selected_result["label"],
-    )
-
-    selected_metrics_display.insert(
-        2,
-        "Trace",
-        selected_trace,
-    )
-
-    st.dataframe(
-        selected_metrics_display,
-        use_container_width=True,
+    st.error(
+        current_metric.get(
+            "Status",
+            "Invalid event.",
+        )
     )
 
 
 # ============================================================
-# Cumulative event table: all files and all traces
+# Current trace and cumulative event tables
 # ============================================================
+
+current_trace_table = build_trace_event_table(
+    all_events
+)
+
+st.subheader(
+    "Events for the selected trace"
+)
+
+st.dataframe(
+    current_trace_table,
+    use_container_width=True,
+)
 
 manual_events_df = build_cumulative_event_table(
-    st.session_state.manual_events,
+    st.session_state.trace_events,
     results,
 )
 
 st.subheader(
-    "Cumulative saved manual events: all files and traces"
+    "Cumulative manual events: all files and traces"
 )
 
 if manual_events_df.empty:
     st.info(
-        "No completed manual events have been saved yet. "
-        "After choosing P1, P2, P3, and P4, click "
-        "'Save current four-point event'."
+        "No manual event slots have been created yet."
     )
 else:
     st.dataframe(
@@ -1953,9 +2080,9 @@ workbook = make_workbook(
     manual_events_df,
 )
 
-download_col1, download_col2, download_col3 = st.columns(3)
+download1, download2, download3 = st.columns(3)
 
-with download_col1:
+with download1:
     st.download_button(
         "Download Excel workbook",
         workbook,
@@ -1967,7 +2094,7 @@ with download_col1:
         use_container_width=True,
     )
 
-with download_col2:
+with download2:
     st.download_button(
         "Download cell summary CSV",
         cell_summary.to_csv(
@@ -1978,7 +2105,7 @@ with download_col2:
         use_container_width=True,
     )
 
-with download_col3:
+with download3:
     st.download_button(
         "Download all manual events CSV",
         manual_events_df.to_csv(
