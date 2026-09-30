@@ -254,6 +254,17 @@ def calculate_dff(raw_signal, background_signal, settings, time_values):
     else:
         corrected_signal = raw_signal.copy()
 
+    if settings["negative_signal_policy"] == (
+        "Clip corrected fluorescence below zero to zero"
+    ):
+        corrected_signal = corrected_signal.clip(lower=0)
+
+    if settings["negative_signal_policy"] == (
+        "Exclude ROI if any corrected value is below zero"
+    ) and (corrected_signal < 0).any():
+        dff = pd.Series(np.nan, index=corrected_signal.index)
+        return corrected_signal, dff, np.nan
+
     f0 = get_f0(
         corrected_signal=corrected_signal,
         time_values=time_values,
@@ -1109,6 +1120,20 @@ with st.sidebar:
         ),
     )
 
+    negative_signal_policy = st.radio(
+        "Negative corrected-signal handling",
+        [
+            "Keep negative values (recommended)",
+            "Clip corrected fluorescence below zero to zero",
+            "Exclude ROI if any corrected value is below zero",
+        ],
+        index=0,
+        help=(
+            "Applied after background subtraction and before F0 calculation. "
+            "The recommended option preserves all corrected measurements."
+        ),
+    )
+
     st.divider()
 
     st.header("F0 settings")
@@ -1358,16 +1383,11 @@ with st.expander(
         )
 
     with mapping_col4:
-        selected_signal_columns = st.multiselect(
-            "Cell signal columns",
-            all_columns,
-            default=first_detected["signal_cols"],
+        st.info(
+            "ROI signal columns are detected independently in every file. "
+            "All columns named Mean1, Mean2, Mean3, etc. are analyzed. "
+            "Mean(background) is reserved for background correction."
         )
-
-    st.caption(
-        "Files may contain different numbers of Mean ROI columns. "
-        "Each file will use only the selected columns available in that file."
-    )
 
 
 if (
@@ -1379,11 +1399,6 @@ if (
         "or select 'No background correction'."
     )
     st.stop()
-
-if not selected_signal_columns:
-    st.error("Select at least one cellular fluorescence signal column.")
-    st.stop()
-
 
 # -------------------------------------------------------------------
 # Build settings and validate mapping
@@ -1405,10 +1420,10 @@ settings = {
         if selected_background_column == "<none>"
         else selected_background_column
     ),
-    "signal_columns": selected_signal_columns,
     "frame_interval": frame_interval,
     "time_unit": time_unit,
     "background_mode": background_mode,
+    "negative_signal_policy": negative_signal_policy,
     "f0_mode": f0_mode,
     "f0_n": f0_n,
     "baseline_start": baseline_start,
@@ -1428,30 +1443,13 @@ mapping_warnings = []
 for item in loaded_files:
     file_name = item["file_name"]
     df = item["df"]
+    detected = detect_columns(df)
+    file_signal_columns = detected["signal_cols"]
 
-    available_signal_columns = [
-        column
-        for column in selected_signal_columns
-        if column in df.columns
-    ]
-
-    missing_signal_columns = [
-        column
-        for column in selected_signal_columns
-        if column not in df.columns
-    ]
-
-    if missing_signal_columns:
-        mapping_warnings.append(
-            f"{file_name}: using {len(available_signal_columns)} available "
-            f"ROI signal column(s); skipped missing columns: "
-            f"{', '.join(map(str, missing_signal_columns))}"
-        )
-
-    if not available_signal_columns:
+    if not file_signal_columns:
         mapping_errors.append(
-            f"{file_name}: none of the selected cell signal columns "
-            "were found in this file."
+            f"{file_name}: no cellular Mean ROI columns were detected. "
+            "Expected columns such as Mean1, Mean2, Mean3, etc."
         )
 
     if (
@@ -1459,7 +1457,7 @@ for item in loaded_files:
         and settings["background_column"] not in df.columns
     ):
         mapping_errors.append(
-            f"{file_name}: missing required background column "
+            f"{file_name}: missing required empty-area background column "
             f"'{settings['background_column']}'."
         )
 
@@ -1501,14 +1499,11 @@ for item in loaded_files:
     file_name = item["file_name"]
     df = item["df"]
 
-    available_signal_columns = [
-        column
-        for column in selected_signal_columns
-        if column in df.columns
-    ]
+    detected = detect_columns(df)
+    file_signal_columns = detected["signal_cols"]
 
     file_settings = settings.copy()
-    file_settings["signal_columns"] = available_signal_columns
+    file_settings["signal_columns"] = file_signal_columns
 
     result = process_calcium_file(
         df=df,
