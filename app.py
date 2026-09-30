@@ -150,6 +150,20 @@ def detect_columns(df):
         "area_cols": area_cols,
     }
 
+def get_available_signal_columns(df, requested_signal_columns):
+    """
+    Return only selected signal columns that actually exist in this file.
+
+    This allows different files to have different numbers of ROI traces:
+    for example, Mean1–Mean12 in one file and Mean1–Mean10 in another.
+    """
+    available_columns = [
+        column
+        for column in requested_signal_columns
+        if column in df.columns
+    ]
+
+    return available_columns
 
 # -------------------------------------------------------------------
 # Fluorescence and ΔF/F0 calculations
