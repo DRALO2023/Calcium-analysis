@@ -10,36 +10,43 @@ from scipy import stats
 from scipy.signal import find_peaks
 
 
-st.set_page_config(page_title="Calcium Analysis", layout="wide")
+# ============================================================
+# App setup
+# ============================================================
+
+st.set_page_config(
+    page_title="Calcium Analysis",
+    layout="wide",
+)
 
 st.title("Calcium Imaging Post-Analysis")
 st.caption(
-    "Multi-file calcium analysis with empty-area background subtraction, "
-    "ΔF/F0 normalization, peak detection, and event-wise uptake/release rates."
+    "Multi-file calcium analysis with per-file ROI detection, "
+    "empty-area background correction, ΔF/F0 normalization, "
+    "automatic candidate events, and manual uptake/decay curation."
 )
-
-
-# -------------------------------------------------------------------
-# Session state
-# -------------------------------------------------------------------
 
 if "uploader_token" not in st.session_state:
     st.session_state.uploader_token = 0
 
 
 def reset_analysis():
-    """Clear selections and reset file upload widgets."""
-    token = st.session_state.uploader_token + 1
+    """
+    Reset all user selections and clear uploaded files.
+    """
+    new_token = st.session_state.uploader_token + 1
     st.session_state.clear()
-    st.session_state.uploader_token = token
+    st.session_state.uploader_token = new_token
 
 
-# -------------------------------------------------------------------
-# Input and column detection
-# -------------------------------------------------------------------
+# ============================================================
+# Input functions
+# ============================================================
 
 def read_table(uploaded_file):
-    """Read CSV or Excel upload into a DataFrame."""
+    """
+    Read a CSV, XLSX, or XLS file.
+    """
     filename = uploaded_file.name.lower()
 
     if filename.endswith(".csv"):
@@ -49,12 +56,20 @@ def read_table(uploaded_file):
 
 
 def normalize_column_name(column_name):
-    """Create a simple normalized column name for matching."""
-    return re.sub(r"[^a-z0-9]", "", str(column_name).lower())
+    """
+    Normalize a column name for detection.
+    """
+    return re.sub(
+        r"[^a-z0-9]",
+        "",
+        str(column_name).lower(),
+    )
 
 
 def get_first_valid_value(series):
-    """Return the first non-missing numeric or text value."""
+    """
+    Return the first non-empty value from a series.
+    """
     valid = series.dropna()
 
     if valid.empty:
@@ -65,20 +80,23 @@ def get_first_valid_value(series):
 
 def detect_columns(df):
     """
-    Suggest likely Label, time, background, area, and signal columns.
+    Detect likely Label, Time, Mean ROI, Area, and background columns.
 
-    Expected calcium format:
-    Label
-    Frame / Time
-    Area1, Mean1, Area2, Mean2, ...
-    Area(background), Mean(background)
+    ROI fluorescence columns must match:
+        Mean1, Mean2, Mean3, ..., MeanN
+
+    Mean(background) is excluded from ROI signals.
     """
     columns = list(df.columns)
-    normalized = {col: normalize_column_name(col) for col in columns}
+    normalized = {
+        column: normalize_column_name(column)
+        for column in columns
+    }
 
     label_candidates = [
-        col for col in columns
-        if normalized[col] in {
+        column
+        for column in columns
+        if normalized[column] in {
             "label",
             "condition",
             "sample",
@@ -87,227 +105,274 @@ def detect_columns(df):
             "treatment",
         }
     ]
-    label_col = label_candidates[0] if label_candidates else None
+
+    label_column = (
+        label_candidates[0]
+        if label_candidates
+        else None
+    )
 
     background_candidates = [
-        col for col in columns
-        if "background" in normalized[col] and "mean" in normalized[col]
+        column
+        for column in columns
+        if (
+            "background" in normalized[column]
+            and "mean" in normalized[column]
+        )
     ]
 
     if not background_candidates:
         background_candidates = [
-            col for col in columns
-            if normalized[col] in {"background", "bg", "meanbg"}
+            column
+            for column in columns
+            if normalized[column] in {
+                "background",
+                "bg",
+                "meanbg",
+            }
         ]
 
-    background_col = (
+    background_column = (
         background_candidates[0]
         if background_candidates
         else None
     )
 
-    area_cols = [
-        col for col in columns
-        if normalized[col].startswith("area")
+    area_columns = [
+        column
+        for column in columns
+        if normalized[column].startswith("area")
     ]
 
-    signal_cols = []
+    signal_columns = []
 
-    for col in columns:
-        normalized_name = normalized[col]
+    for column in columns:
+        name = normalized[column]
 
-        if col == background_col:
+        if column == background_column:
             continue
 
-        if re.fullmatch(r"mean\d+", normalized_name):
-            signal_cols.append(col)
+        if re.fullmatch(r"mean\d+", name):
+            signal_columns.append(column)
 
-    numeric_cols = [
-        col for col in columns
-        if pd.api.types.is_numeric_dtype(df[col])
+    numeric_columns = [
+        column
+        for column in columns
+        if pd.api.types.is_numeric_dtype(df[column])
     ]
 
-    excluded_columns = set(signal_cols + area_cols)
+    excluded_columns = set(
+        signal_columns
+        + area_columns
+    )
 
-    if label_col is not None:
-        excluded_columns.add(label_col)
+    if label_column is not None:
+        excluded_columns.add(label_column)
 
-    if background_col is not None:
-        excluded_columns.add(background_col)
+    if background_column is not None:
+        excluded_columns.add(background_column)
 
     time_candidates = [
-        col for col in numeric_cols
-        if col not in excluded_columns
+        column
+        for column in numeric_columns
+        if column not in excluded_columns
     ]
 
-    time_col = time_candidates[0] if time_candidates else None
+    time_column = (
+        time_candidates[0]
+        if time_candidates
+        else None
+    )
 
     return {
-        "label_col": label_col,
-        "time_col": time_col,
-        "background_col": background_col,
-        "signal_cols": signal_cols,
-        "area_cols": area_cols,
+        "label_column": label_column,
+        "time_column": time_column,
+        "background_column": background_column,
+        "signal_columns": signal_columns,
+        "area_columns": area_columns,
     }
 
-def get_available_signal_columns(df, requested_signal_columns):
+
+# ============================================================
+# Time and fluorescence calculations
+# ============================================================
+
+def make_time_vector(df, selected_time_column, frame_interval):
     """
-    Return only selected signal columns that actually exist in this file.
+    Convert a frame/index column into elapsed time.
 
-    This allows different files to have different numbers of ROI traces:
-    for example, Mean1–Mean12 in one file and Mean1–Mean10 in another.
+    If no time column is selected, row order becomes the frame index.
     """
-    available_columns = [
-        column
-        for column in requested_signal_columns
-        if column in df.columns
-    ]
+    if selected_time_column is not None:
+        raw_frame = pd.to_numeric(
+            df[selected_time_column],
+            errors="coerce",
+        )
+    else:
+        raw_frame = pd.Series(
+            np.arange(len(df)),
+            index=df.index,
+            dtype=float,
+        )
 
-    return available_columns
+    if raw_frame.notna().sum() >= 2:
+        raw_frame = raw_frame.ffill().bfill()
+    else:
+        raw_frame = pd.Series(
+            np.arange(len(df)),
+            index=df.index,
+            dtype=float,
+        )
 
-# -------------------------------------------------------------------
-# Fluorescence and ΔF/F0 calculations
-# -------------------------------------------------------------------
+    elapsed_time = (
+        raw_frame - raw_frame.iloc[0]
+    ) * frame_interval
 
-def get_f0(
+    return raw_frame, elapsed_time
+
+
+def calculate_f0(
     corrected_signal,
     time_values,
-    mode,
-    n_rows=5,
-    baseline_start=None,
-    baseline_end=None,
+    f0_mode,
+    f0_n,
+    baseline_start,
+    baseline_end,
 ):
     """
-    Calculate F0 from a background-corrected signal.
-
-    Parameters
-    ----------
-    corrected_signal : pandas Series
-        Background-corrected fluorescence trace.
-    time_values : pandas Series
-        Time vector in user-selected units.
-    mode : str
-        Selected F0 method.
-    n_rows : int
-        Number of valid baseline points for early-frame averaging.
-    baseline_start : float
-        Start of baseline time window.
-    baseline_end : float
-        End of baseline time window.
+    Calculate F0 from a corrected fluorescence trace.
     """
-    values = pd.to_numeric(corrected_signal, errors="coerce")
-    times = pd.to_numeric(time_values, errors="coerce")
+    values = pd.to_numeric(
+        corrected_signal,
+        errors="coerce",
+    )
+
+    times = pd.to_numeric(
+        time_values,
+        errors="coerce",
+    )
 
     valid_values = values.dropna()
 
     if valid_values.empty:
         return np.nan
 
-    if mode == "First valid value":
+    if f0_mode == "First valid value":
         return float(valid_values.iloc[0])
 
-    if mode == "Mean of first N valid rows":
-        return float(valid_values.iloc[:max(1, int(n_rows))].mean())
+    if f0_mode == "Mean of first N valid rows":
+        return float(
+            valid_values.iloc[:max(1, int(f0_n))].mean()
+        )
 
-    if mode == "Minimum value in trace":
+    if f0_mode == "Minimum value in trace":
         return float(valid_values.min())
 
-    if mode == "Lower quartile (25th percentile)":
+    if f0_mode == "Lower quartile (25th percentile)":
         return float(valid_values.quantile(0.25))
 
-    if mode == "Mean within baseline-time window":
+    if f0_mode == "Mean within baseline-time window":
         if baseline_start is None or baseline_end is None:
             return np.nan
 
-        mask = (
+        baseline_mask = (
             (times >= baseline_start)
             & (times <= baseline_end)
             & values.notna()
         )
 
-        window_values = values.loc[mask]
+        baseline_values = values.loc[baseline_mask]
 
-        if window_values.empty:
+        if baseline_values.empty:
             return np.nan
 
-        return float(window_values.mean())
+        return float(baseline_values.mean())
 
     return float(valid_values.iloc[0])
 
 
-def calculate_dff(raw_signal, background_signal, settings, time_values):
+def calculate_corrected_trace_and_dff(
+    raw_signal,
+    background_signal,
+    settings,
+    time_values,
+):
     """
-    Calculate background-corrected fluorescence and ΔF/F0.
+    Calculate corrected fluorescence and ΔF/F0.
 
-    Recommended calculation:
-        F_corrected = F_ROI - F_background
-        ΔF/F0 = (F_corrected - F0_corrected) / F0_corrected
+    Default:
+        F corrected = F ROI - F background
+        ΔF/F0 = (F corrected - F0) / F0
     """
-    raw_signal = pd.to_numeric(raw_signal, errors="coerce")
+    raw_signal = pd.to_numeric(
+        raw_signal,
+        errors="coerce",
+    )
 
-    if settings["background_mode"] == "Subtract empty-area background before ΔF/F0":
+    if (
+        settings["background_mode"]
+        == "Subtract empty-area background before ΔF/F0"
+    ):
         background_signal = pd.to_numeric(
             background_signal,
             errors="coerce",
         )
+
         corrected_signal = raw_signal - background_signal
+
     else:
         corrected_signal = raw_signal.copy()
 
-    if settings["negative_signal_policy"] == (
-        "Clip corrected fluorescence below zero to zero"
-    ):
+    policy = settings["negative_signal_policy"]
+
+    if policy == "Clip corrected fluorescence below zero to zero":
         corrected_signal = corrected_signal.clip(lower=0)
 
-    if settings["negative_signal_policy"] == (
-        "Exclude ROI if any corrected value is below zero"
-    ) and (corrected_signal < 0).any():
-        dff = pd.Series(np.nan, index=corrected_signal.index)
-        return corrected_signal, dff, np.nan
+    if policy == "Exclude ROI if any corrected value is below zero":
+        if (corrected_signal < 0).any():
+            dff = pd.Series(
+                np.nan,
+                index=corrected_signal.index,
+            )
 
-    f0 = get_f0(
+            return corrected_signal, dff, np.nan
+
+    f0 = calculate_f0(
         corrected_signal=corrected_signal,
         time_values=time_values,
-        mode=settings["f0_mode"],
-        n_rows=settings["f0_n"],
+        f0_mode=settings["f0_mode"],
+        f0_n=settings["f0_n"],
         baseline_start=settings["baseline_start"],
         baseline_end=settings["baseline_end"],
     )
 
+    # Preserve all corrected values, but do not calculate a normalized
+    # trace when the selected baseline denominator is invalid.
     if not np.isfinite(f0) or f0 <= 0:
-        dff = pd.Series(np.nan, index=corrected_signal.index)
+        dff = pd.Series(
+            np.nan,
+            index=corrected_signal.index,
+        )
+
         return corrected_signal, dff, f0
 
-    dff = (corrected_signal - f0) / f0
+    dff = (
+        corrected_signal - f0
+    ) / f0
 
     return corrected_signal, dff, f0
 
 
-# -------------------------------------------------------------------
-# Event detection and rate calculations
-# -------------------------------------------------------------------
+# ============================================================
+# Automatic candidate event detection
+# ============================================================
 
-def interpolate_zero_crossing(x1, y1, x2, y2):
+def calculate_linear_slope(x_values, y_values):
     """
-    Estimate the time at which the trace crosses zero between two points.
+    Return linear-regression slope.
     """
-    if not np.isfinite([x1, y1, x2, y2]).all():
-        return float(x2)
-
-    if y2 == y1:
-        return float(x2)
-
-    return float(
-        x1 + (0 - y1) * (x2 - x1) / (y2 - y1)
-    )
-
-
-def calculate_slope(x, y):
-    """
-    Calculate linear-regression slope for a trace segment.
-    """
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
+    x = np.asarray(x_values, dtype=float)
+    y = np.asarray(y_values, dtype=float)
 
     valid = np.isfinite(x) & np.isfinite(y)
 
@@ -325,61 +390,12 @@ def calculate_slope(x, y):
     return float(slope)
 
 
-def find_event_start(x, y, peak_index):
+def calculate_auc_above_zero(x_values, y_values):
     """
-    Find the previous point at or below zero before a positive peak.
-
-    Returns:
-        start_index, interpolated_start_time
+    Positive area under a ΔF/F0 curve.
     """
-    for index in range(peak_index - 1, -1, -1):
-        if y[index] <= 0:
-            if index < peak_index and y[index + 1] > 0:
-                zero_time = interpolate_zero_crossing(
-                    x[index],
-                    y[index],
-                    x[index + 1],
-                    y[index + 1],
-                )
-                return index, zero_time
-
-            return index, float(x[index])
-
-    return 0, float(x[0])
-
-
-def find_event_end(x, y, peak_index):
-    """
-    Find the first return to zero or below after a positive peak.
-
-    Returns:
-        end_index, interpolated_end_time
-
-    If no return to baseline occurs, returns:
-        None, NaN
-    """
-    for index in range(peak_index + 1, len(y)):
-        if y[index] <= 0:
-            if y[index - 1] > 0:
-                zero_time = interpolate_zero_crossing(
-                    x[index - 1],
-                    y[index - 1],
-                    x[index],
-                    y[index],
-                )
-                return index, zero_time
-
-            return index, float(x[index])
-
-    return None, np.nan
-
-
-def calculate_auc_above_zero(x, y):
-    """
-    Calculate positive area under the curve only.
-    """
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
+    x = np.asarray(x_values, dtype=float)
+    y = np.asarray(y_values, dtype=float)
 
     valid = np.isfinite(x) & np.isfinite(y)
 
@@ -389,232 +405,397 @@ def calculate_auc_above_zero(x, y):
     if len(x) < 2:
         return np.nan
 
-    positive_y = np.maximum(y, 0)
+    y_positive = np.maximum(y, 0)
 
     if hasattr(np, "trapezoid"):
-        return float(np.trapezoid(positive_y, x))
+        return float(np.trapezoid(y_positive, x))
 
-    return float(np.trapz(positive_y, x))
+    return float(np.trapz(y_positive, x))
 
 
-def detect_calcium_events(time_values, dff_values, settings):
+def detect_auto_event_candidates(
+    frame_values,
+    time_values,
+    dff_values,
+    settings,
+):
     """
-    Detect significant positive calcium-response events.
+    Detect candidate local maxima.
 
-    An accepted event:
-    - Must exceed zero and minimum peak height.
-    - Must meet minimum prominence.
-    - Must be separated by configured distance.
-    - Gets uptake rate from baseline/zero to peak.
-    - Gets release rate only if it returns to zero after the peak.
+    These are preliminary candidates for manual curation,
+    not necessarily final biological calcium events.
     """
-    x = np.asarray(time_values, dtype=float)
-    y = np.asarray(dff_values, dtype=float)
+    frames = np.asarray(frame_values, dtype=float)
+    times = np.asarray(time_values, dtype=float)
+    values = np.asarray(dff_values, dtype=float)
 
-    valid = np.isfinite(x) & np.isfinite(y)
-
-    x = x[valid]
-    y = y[valid]
-
-    if len(x) < 3:
-        return pd.DataFrame()
-
-    peak_indices, peak_properties = find_peaks(
-        y,
-        height=settings["min_peak_height"],
-        prominence=settings["min_peak_prominence"],
-        distance=max(1, int(settings["min_peak_distance"])),
+    valid = (
+        np.isfinite(frames)
+        & np.isfinite(times)
+        & np.isfinite(values)
     )
 
-    event_rows = []
+    frames = frames[valid]
+    times = times[valid]
+    values = values[valid]
 
-    for event_number, peak_index in enumerate(peak_indices, start=1):
-        peak_value = float(y[peak_index])
+    if len(values) < 3:
+        return pd.DataFrame()
 
-        if peak_value <= 0:
-            continue
+    peak_indices, properties = find_peaks(
+        values,
+        height=settings["min_peak_height"],
+        prominence=settings["min_peak_prominence"],
+        distance=max(
+            1,
+            int(settings["min_peak_distance"]),
+        ),
+    )
 
-        start_index, start_time = find_event_start(
-            x,
-            y,
-            peak_index,
-        )
+    candidate_rows = []
 
-        end_index, end_time = find_event_end(
-            x,
-            y,
-            peak_index,
-        )
-
-        rise_x = x[start_index:peak_index + 1]
-        rise_y = y[start_index:peak_index + 1]
-
-        if len(rise_x) >= settings["min_event_points"]:
-            uptake_slope = calculate_slope(rise_x, rise_y)
-        else:
-            uptake_slope = np.nan
-
-        if (
-            len(rise_x) >= 2
-            and np.all(np.diff(rise_x) > 0)
-        ):
-            instantaneous_rise = np.diff(rise_y) / np.diff(rise_x)
-            max_rise_rate = float(np.nanmax(instantaneous_rise))
-        else:
-            max_rise_rate = np.nan
-
-        if end_index is not None:
-            release_x = x[peak_index:end_index + 1]
-            release_y = y[peak_index:end_index + 1]
-
-            if len(release_x) >= settings["min_event_points"]:
-                release_slope = calculate_slope(
-                    release_x,
-                    release_y,
-                )
-            else:
-                release_slope = np.nan
-
-            if (
-                len(release_x) >= 2
-                and np.all(np.diff(release_x) > 0)
-            ):
-                instantaneous_release = (
-                    np.diff(release_y)
-                    / np.diff(release_x)
-                )
-                max_decay_rate = float(
-                    np.nanmin(instantaneous_release)
-                )
-            else:
-                max_decay_rate = np.nan
-
-            event_duration = float(end_time - start_time)
-
-            event_auc = calculate_auc_above_zero(
-                x[start_index:end_index + 1],
-                y[start_index:end_index + 1],
-            )
-
-            release_status = "Returned to baseline"
-
-        else:
-            release_slope = np.nan
-            max_decay_rate = np.nan
-            event_duration = np.nan
-            event_auc = np.nan
-            release_status = "No return to baseline"
-
-        prominence = float(
-            peak_properties["prominences"][event_number - 1]
-        )
-
-        event_rows.append(
+    for candidate_number, peak_index in enumerate(
+        peak_indices,
+        start=1,
+    ):
+        candidate_rows.append(
             {
-                "Event": event_number,
-                "Start time": start_time,
-                "Peak time": float(x[peak_index]),
-                "End time": end_time,
-                "Peak ΔF/F0": peak_value,
-                "Prominence": prominence,
-                "Duration": event_duration,
-                "AUC above baseline": event_auc,
-                "Uptake slope": uptake_slope,
-                "Maximum rise rate": max_rise_rate,
-                "Release slope": release_slope,
-                "Release magnitude": (
-                    -release_slope
-                    if np.isfinite(release_slope)
-                    else np.nan
+                "Auto event": candidate_number,
+                "Peak frame": int(frames[peak_index]),
+                "Peak time": float(times[peak_index]),
+                "Peak ΔF/F0": float(values[peak_index]),
+                "Peak prominence": float(
+                    properties["prominences"][
+                        candidate_number - 1
+                    ]
                 ),
-                "Maximum decay rate": max_decay_rate,
-                "Release status": release_status,
             }
         )
 
-    return pd.DataFrame(event_rows)
+    return pd.DataFrame(candidate_rows)
 
 
-# -------------------------------------------------------------------
+# ============================================================
+# Manual event metrics
+# ============================================================
+
+def get_trace_value_by_frame(processed_df, frame_value, trace_column):
+    """
+    Obtain one trace value from an exact selected frame.
+    """
+    matching_rows = processed_df[
+        processed_df["Frame"] == frame_value
+    ]
+
+    if matching_rows.empty:
+        return np.nan, np.nan
+
+    row = matching_rows.iloc[0]
+
+    return (
+        float(row["Time"]),
+        float(row[trace_column]),
+    )
+
+
+def calculate_manual_event_metrics(
+    processed_df,
+    trace_column,
+    curated_event_df,
+):
+    """
+    Calculate uptake and release/decay metrics for manually chosen points.
+
+    Selected points:
+        Start frame -> Peak frame -> End frame
+
+    The endpoint does not need to reach zero. It can be a local trough,
+    next response boundary, recording end, or a manually selected point.
+    """
+    if curated_event_df.empty:
+        return pd.DataFrame()
+
+    metric_rows = []
+
+    for _, row in curated_event_df.iterrows():
+        include_event = bool(row.get("Include", True))
+
+        if not include_event:
+            continue
+
+        start_frame = row.get("Start frame", np.nan)
+        peak_frame = row.get("Peak frame", np.nan)
+        end_frame = row.get("End frame", np.nan)
+
+        if (
+            pd.isna(start_frame)
+            or pd.isna(peak_frame)
+            or pd.isna(end_frame)
+        ):
+            continue
+
+        start_time, start_value = get_trace_value_by_frame(
+            processed_df,
+            start_frame,
+            trace_column,
+        )
+
+        peak_time, peak_value = get_trace_value_by_frame(
+            processed_df,
+            peak_frame,
+            trace_column,
+        )
+
+        end_time, end_value = get_trace_value_by_frame(
+            processed_df,
+            end_frame,
+            trace_column,
+        )
+
+        if not np.isfinite(
+            [
+                start_time,
+                start_value,
+                peak_time,
+                peak_value,
+                end_time,
+                end_value,
+            ]
+        ).all():
+            continue
+
+        if not (
+            start_time < peak_time < end_time
+        ):
+            status = (
+                "Invalid: require Start time < Peak time < End time"
+            )
+
+            metric_rows.append(
+                {
+                    "Event ID": row.get("Event ID", ""),
+                    "Status": status,
+                }
+            )
+
+            continue
+
+        uptake_mask = (
+            (processed_df["Time"] >= start_time)
+            & (processed_df["Time"] <= peak_time)
+        )
+
+        decay_mask = (
+            (processed_df["Time"] >= peak_time)
+            & (processed_df["Time"] <= end_time)
+        )
+
+        uptake_x = processed_df.loc[
+            uptake_mask,
+            "Time",
+        ].to_numpy()
+
+        uptake_y = processed_df.loc[
+            uptake_mask,
+            trace_column,
+        ].to_numpy()
+
+        decay_x = processed_df.loc[
+            decay_mask,
+            "Time",
+        ].to_numpy()
+
+        decay_y = processed_df.loc[
+            decay_mask,
+            trace_column,
+        ].to_numpy()
+
+        uptake_time = peak_time - start_time
+        uptake_amplitude = peak_value - start_value
+
+        endpoint_uptake_rate = (
+            uptake_amplitude / uptake_time
+            if uptake_time > 0
+            else np.nan
+        )
+
+        regression_uptake_slope = calculate_linear_slope(
+            uptake_x,
+            uptake_y,
+        )
+
+        release_time = end_time - peak_time
+        release_amplitude = end_value - peak_value
+
+        observed_decay_rate = (
+            release_amplitude / release_time
+            if release_time > 0
+            else np.nan
+        )
+
+        regression_decay_slope = calculate_linear_slope(
+            decay_x,
+            decay_y,
+        )
+
+        if len(uptake_x) >= 2:
+            uptake_diffs = (
+                np.diff(uptake_y)
+                / np.diff(uptake_x)
+            )
+
+            max_rise_rate = float(
+                np.nanmax(uptake_diffs)
+            )
+        else:
+            max_rise_rate = np.nan
+
+        if len(decay_x) >= 2:
+            decay_diffs = (
+                np.diff(decay_y)
+                / np.diff(decay_x)
+            )
+
+            max_decay_rate = float(
+                np.nanmin(decay_diffs)
+            )
+        else:
+            max_decay_rate = np.nan
+
+        event_auc = calculate_auc_above_zero(
+            processed_df.loc[
+                (
+                    (processed_df["Time"] >= start_time)
+                    & (processed_df["Time"] <= end_time)
+                ),
+                "Time",
+            ].to_numpy(),
+            processed_df.loc[
+                (
+                    (processed_df["Time"] >= start_time)
+                    & (processed_df["Time"] <= end_time)
+                ),
+                trace_column,
+            ].to_numpy(),
+        )
+
+        metric_rows.append(
+            {
+                "Event ID": row.get("Event ID", ""),
+                "Include": include_event,
+                "Event category": row.get(
+                    "Event category",
+                    "",
+                ),
+                "Endpoint type": row.get(
+                    "Endpoint type",
+                    "",
+                ),
+                "Notes": row.get("Notes", ""),
+                "Start frame": start_frame,
+                "Start time": start_time,
+                "Start ΔF/F0": start_value,
+                "Peak frame": peak_frame,
+                "Peak time": peak_time,
+                "Peak ΔF/F0": peak_value,
+                "End frame": end_frame,
+                "End time": end_time,
+                "End ΔF/F0": end_value,
+                "Uptake duration": uptake_time,
+                "Uptake amplitude": uptake_amplitude,
+                "Endpoint uptake rate": endpoint_uptake_rate,
+                "Regression uptake slope": regression_uptake_slope,
+                "Maximum rise rate": max_rise_rate,
+                "Decay duration": release_time,
+                "Decay amplitude": release_amplitude,
+                "Observed decay rate": observed_decay_rate,
+                "Regression decay slope": regression_decay_slope,
+                "Release magnitude": (
+                    -observed_decay_rate
+                    if np.isfinite(observed_decay_rate)
+                    else np.nan
+                ),
+                "Maximum decay rate": max_decay_rate,
+                "Event AUC above zero": event_auc,
+                "Status": "Included",
+            }
+        )
+
+    return pd.DataFrame(metric_rows)
+
+
+# ============================================================
 # Per-file processing
-# -------------------------------------------------------------------
+# ============================================================
 
-def make_time_vector(df, time_column, frame_interval):
+def process_calcium_file(
+    df,
+    file_name,
+    settings,
+):
     """
-    Create elapsed-time vector.
+    Process one uploaded file.
 
-    If a numeric time/frame column exists:
-        elapsed_time = (value - first_value) * frame_interval
-
-    Otherwise:
-        elapsed_time = row_index * frame_interval
+    Every detected Mean1...MeanN column in this file is analyzed.
     """
-    if time_column is not None:
-        raw_time = pd.to_numeric(
-            df[time_column],
-            errors="coerce",
-        )
-    else:
-        raw_time = pd.Series(
-            np.arange(len(df)),
-            index=df.index,
-            dtype=float,
-        )
+    file_detection = detect_columns(df)
 
-    if raw_time.notna().sum() >= 2:
-        raw_time = raw_time.ffill().bfill()
-    else:
-        raw_time = pd.Series(
-            np.arange(len(df)),
-            index=df.index,
-            dtype=float,
-        )
+    file_signal_columns = (
+        file_detection["signal_columns"]
+    )
 
-    elapsed_time = (
-        raw_time - raw_time.iloc[0]
-    ) * frame_interval
-
-    return raw_time, elapsed_time
-
-
-def process_calcium_file(df, file_name, settings):
-    """
-    Process one calcium imaging file and return all trace/event outputs.
-    """
     label_column = settings["label_column"]
     time_column = settings["time_column"]
     background_column = settings["background_column"]
-    signal_columns = settings["signal_columns"]
 
-    frame_values, time_values = make_time_vector(
+    raw_frames, elapsed_time = make_time_vector(
         df=df,
-        time_column=time_column,
+        selected_time_column=time_column,
         frame_interval=settings["frame_interval"],
     )
 
-    if label_column is not None:
-        label_value = get_first_valid_value(df[label_column])
+    if (
+        label_column is not None
+        and label_column in df.columns
+    ):
+        label_value = get_first_valid_value(
+            df[label_column]
+        )
+
         label = str(label_value)
+
     else:
-        label = ""
+        label = re.sub(
+            r"\.[^.]+$",
+            "",
+            file_name,
+        )
 
     if label.strip() == "" or label.lower() == "nan":
-        label = re.sub(r"\.[^.]+$", "", file_name)
+        label = re.sub(
+            r"\.[^.]+$",
+            "",
+            file_name,
+        )
 
     processed_df = pd.DataFrame(
         {
-            "Frame": frame_values,
-            "Time": time_values,
+            "Frame": raw_frames,
+            "Time": elapsed_time,
         }
     )
 
-    if background_column is not None:
+    if (
+        background_column is not None
+        and background_column in df.columns
+    ):
         background_signal = pd.to_numeric(
             df[background_column],
             errors="coerce",
         )
 
         processed_df["Background"] = background_signal
+
     else:
         background_signal = pd.Series(
             0.0,
@@ -623,29 +804,40 @@ def process_calcium_file(df, file_name, settings):
 
     warnings = []
     cell_summary_rows = []
-    cell_event_tables = []
+    auto_event_tables = []
 
-    for signal_column in signal_columns:
+    for signal_column in file_signal_columns:
         raw_signal = pd.to_numeric(
             df[signal_column],
             errors="coerce",
         )
 
-        corrected_signal, dff_signal, f0 = calculate_dff(
-            raw_signal=raw_signal,
-            background_signal=background_signal,
-            settings=settings,
-            time_values=time_values,
+        corrected_signal, dff_signal, f0 = (
+            calculate_corrected_trace_and_dff(
+                raw_signal=raw_signal,
+                background_signal=background_signal,
+                settings=settings,
+                time_values=elapsed_time,
+            )
         )
 
-        processed_df[f"Raw | {signal_column}"] = raw_signal
-        processed_df[f"Corrected | {signal_column}"] = corrected_signal
-        processed_df[f"dF/F0 | {signal_column}"] = dff_signal
+        processed_df[
+            f"Raw | {signal_column}"
+        ] = raw_signal
+
+        processed_df[
+            f"Corrected | {signal_column}"
+        ] = corrected_signal
+
+        processed_df[
+            f"dF/F0 | {signal_column}"
+        ] = dff_signal
 
         if not np.isfinite(f0) or f0 <= 0:
             warnings.append(
-                f"{file_name} — {signal_column} was excluded because "
-                "its corrected F0 was missing, zero, or negative."
+                f"{file_name} — {signal_column} excluded from "
+                "ΔF/F0 calculations because corrected F0 was "
+                "missing, zero, or negative."
             )
 
             cell_summary_rows.append(
@@ -657,25 +849,26 @@ def process_calcium_file(df, file_name, settings):
                     "Peak ΔF/F0": np.nan,
                     "Peak time": np.nan,
                     "AUC above baseline": np.nan,
-                    "Event count": 0,
-                    "Status": "Excluded: invalid corrected F0",
+                    "Auto candidate count": 0,
+                    "Status": "Excluded: invalid F0",
                 }
             )
 
             continue
 
-        events = detect_calcium_events(
-            time_values=time_values.to_numpy(),
+        auto_events = detect_auto_event_candidates(
+            frame_values=raw_frames.to_numpy(),
+            time_values=elapsed_time.to_numpy(),
             dff_values=dff_signal.to_numpy(),
             settings=settings,
         )
 
-        if not events.empty:
-            events.insert(0, "ROI", signal_column)
-            events.insert(0, "Label", label)
-            events.insert(0, "File", file_name)
+        if not auto_events.empty:
+            auto_events.insert(0, "ROI", signal_column)
+            auto_events.insert(0, "Label", label)
+            auto_events.insert(0, "File", file_name)
 
-            cell_event_tables.append(events)
+            auto_event_tables.append(auto_events)
 
         valid_dff = dff_signal.dropna()
 
@@ -683,13 +876,20 @@ def process_calcium_file(df, file_name, settings):
             peak_value = np.nan
             peak_time = np.nan
             auc_value = np.nan
+
         else:
             peak_index = dff_signal.idxmax()
-            peak_value = float(dff_signal.loc[peak_index])
-            peak_time = float(time_values.loc[peak_index])
+
+            peak_value = float(
+                dff_signal.loc[peak_index]
+            )
+
+            peak_time = float(
+                elapsed_time.loc[peak_index]
+            )
 
             auc_value = calculate_auc_above_zero(
-                time_values.to_numpy(),
+                elapsed_time.to_numpy(),
                 dff_signal.to_numpy(),
             )
 
@@ -702,116 +902,94 @@ def process_calcium_file(df, file_name, settings):
                 "Peak ΔF/F0": peak_value,
                 "Peak time": peak_time,
                 "AUC above baseline": auc_value,
-                "Event count": len(events),
+                "Auto candidate count": len(auto_events),
                 "Status": "Included",
             }
         )
 
     dff_columns = [
-        column for column in processed_df.columns
+        column
+        for column in processed_df.columns
         if column.startswith("dF/F0 | ")
     ]
 
     if dff_columns:
-        processed_df["Average dF/F0"] = processed_df[
-            dff_columns
-        ].mean(axis=1, skipna=True)
+        processed_df["Average dF/F0"] = (
+            processed_df[dff_columns]
+            .mean(axis=1, skipna=True)
+        )
 
-        processed_df["SEM dF/F0"] = processed_df[
-            dff_columns
-        ].sem(axis=1, ddof=1)
+        processed_df["SEM dF/F0"] = (
+            processed_df[dff_columns]
+            .sem(axis=1, ddof=1)
+        )
 
     else:
         processed_df["Average dF/F0"] = np.nan
         processed_df["SEM dF/F0"] = np.nan
 
-    average_events = detect_calcium_events(
+    average_auto_events = detect_auto_event_candidates(
+        frame_values=processed_df["Frame"].to_numpy(),
         time_values=processed_df["Time"].to_numpy(),
-        dff_values=processed_df["Average dF/F0"].to_numpy(),
+        dff_values=processed_df[
+            "Average dF/F0"
+        ].to_numpy(),
         settings=settings,
     )
 
-    if not average_events.empty:
-        average_events.insert(0, "Trace", "File average")
-        average_events.insert(0, "Label", label)
-        average_events.insert(0, "File", file_name)
+    if not average_auto_events.empty:
+        average_auto_events.insert(
+            0,
+            "Trace",
+            "File average",
+        )
 
-    cell_summary_df = pd.DataFrame(cell_summary_rows)
+        average_auto_events.insert(
+            0,
+            "Label",
+            label,
+        )
 
-    if cell_event_tables:
-        cell_events_df = pd.concat(
-            cell_event_tables,
+        average_auto_events.insert(
+            0,
+            "File",
+            file_name,
+        )
+
+    if auto_event_tables:
+        cell_auto_events_df = pd.concat(
+            auto_event_tables,
             ignore_index=True,
         )
+
     else:
-        cell_events_df = pd.DataFrame()
+        cell_auto_events_df = pd.DataFrame()
 
     return {
         "file_name": file_name,
         "label": label,
         "processed_df": processed_df,
-        "cell_summary_df": cell_summary_df,
-        "cell_events_df": cell_events_df,
-        "average_events_df": average_events,
+        "cell_summary_df": pd.DataFrame(
+            cell_summary_rows
+        ),
+        "cell_auto_events_df": cell_auto_events_df,
+        "average_auto_events_df": average_auto_events,
         "warnings": warnings,
     }
 
 
-# -------------------------------------------------------------------
-# Grouping and plotting
-# -------------------------------------------------------------------
+# ============================================================
+# Plotting
+# ============================================================
 
-def build_file_average_long_table(results):
-    """
-    Make one long table containing the average trace from each file.
-    """
-    rows = []
-
-    for result in results:
-        processed = result["processed_df"]
-
-        file_trace = pd.DataFrame(
-            {
-                "File": result["file_name"],
-                "Label": result["label"],
-                "Time": processed["Time"],
-                "Average dF/F0": processed["Average dF/F0"],
-            }
-        )
-
-        rows.append(file_trace)
-
-    return pd.concat(rows, ignore_index=True)
-
-
-def build_group_average_table(file_average_long):
-    """
-    Average file-level traces within each Label.
-
-    This avoids treating every cell as an independent biological replicate.
-    """
-    grouped = (
-        file_average_long
-        .groupby(["Label", "Time"], as_index=False)
-        .agg(
-            Mean_dF_F0=("Average dF/F0", "mean"),
-            SEM_dF_F0=("Average dF/F0", "sem"),
-            N_files=("File", "nunique"),
-        )
-    )
-
-    return grouped
-
-
-def build_trace_plot(
-    grouped_df,
+def build_file_trace_plot(
     results,
     settings,
 ):
     """
-    Plot label-level mean traces, optional SEM, and optional file-average peaks.
+    Plot each uploaded file separately.
     """
-    palette = [
+    colors = [
         "#1f77b4",
         "#d62728",
         "#2ca02c",
@@ -820,135 +998,287 @@ def build_trace_plot(
         "#17becf",
         "#8c564b",
         "#e377c2",
+        "#bcbd22",
+        "#7f7f7f",
     ]
 
     fig = go.Figure()
 
-    labels = grouped_df["Label"].drop_duplicates().tolist()
+    for index, result in enumerate(results):
+        color = colors[index % len(colors)]
 
-    for index, label in enumerate(labels):
-        color = palette[index % len(palette)]
+        processed_df = result["processed_df"]
 
-        label_data = grouped_df[
-            grouped_df["Label"] == label
-        ].sort_values("Time")
-
-        y_values = label_data["Mean_dF_F0"].to_numpy()
+        x_values = processed_df["Time"].to_numpy()
+        y_values = processed_df[
+            "Average dF/F0"
+        ].to_numpy()
 
         if settings["positive_only"]:
             y_values = np.maximum(y_values, 0)
 
+        trace_name = (
+            f"{result['label']} | {result['file_name']}"
+        )
+
         fig.add_trace(
             go.Scatter(
-                x=label_data["Time"],
+                x=x_values,
                 y=y_values,
                 mode="lines",
-                name=label,
+                name=trace_name,
                 line=dict(
                     color=color,
-                    width=3,
+                    width=2.5,
                 ),
             )
         )
 
-        if (
-            settings["show_sem"]
-            and label_data["N_files"].max() > 1
-        ):
-            sem_values = (
-                label_data["SEM_dF_F0"]
-                .fillna(0)
-                .to_numpy()
-            )
+        if settings["show_auto_peaks"]:
+            auto_events = result[
+                "average_auto_events_df"
+            ]
 
-            upper = y_values + sem_values
-            lower = y_values - sem_values
-
-            if settings["positive_only"]:
-                upper = np.maximum(upper, 0)
-                lower = np.maximum(lower, 0)
-
-            fig.add_trace(
-                go.Scatter(
-                    x=label_data["Time"],
-                    y=upper,
-                    mode="lines",
-                    line=dict(
-                        color=color,
-                        width=0,
-                    ),
-                    showlegend=False,
-                    hoverinfo="skip",
+            if not auto_events.empty:
+                fig.add_trace(
+                    go.Scatter(
+                        x=auto_events["Peak time"],
+                        y=auto_events["Peak ΔF/F0"],
+                        mode="markers",
+                        marker=dict(
+                            symbol="x",
+                            size=10,
+                            color=color,
+                        ),
+                        name=(
+                            f"Auto candidates | "
+                            f"{result['file_name']}"
+                        ),
+                        showlegend=False,
+                        hovertemplate=(
+                            "File: " + result["file_name"]
+                            + "<br>Auto event: %{text}"
+                            + "<br>Peak time: %{x:.3f}"
+                            + "<br>Peak ΔF/F0: %{y:.3f}"
+                            + "<extra></extra>"
+                        ),
+                        text=auto_events[
+                            "Auto event"
+                        ].astype(str),
+                    )
                 )
-            )
-
-            fig.add_trace(
-                go.Scatter(
-                    x=label_data["Time"],
-                    y=lower,
-                    mode="lines",
-                    line=dict(
-                        color=color,
-                        width=0,
-                    ),
-                    fill="tonexty",
-                    fillcolor=(
-                        f"rgba({int(color[1:3], 16)},"
-                        f"{int(color[3:5], 16)},"
-                        f"{int(color[5:7], 16)},0.18)"
-                    ),
-                    showlegend=False,
-                    hoverinfo="skip",
-                )
-            )
-
-    if settings["show_events"]:
-        for result in results:
-            event_df = result["average_events_df"]
-
-            if event_df.empty:
-                continue
-
-            fig.add_trace(
-                go.Scatter(
-                    x=event_df["Peak time"],
-                    y=event_df["Peak ΔF/F0"],
-                    mode="markers",
-                    marker=dict(
-                        symbol="x",
-                        size=10,
-                        color="black",
-                    ),
-                    name=f"{result['label']} accepted peaks",
-                    showlegend=False,
-                    hovertemplate=(
-                        "File: " + result["file_name"]
-                        + "<br>Label: " + result["label"]
-                        + "<br>Peak time: %{x:.3f}"
-                        + "<br>Peak ΔF/F0: %{y:.3f}"
-                        + "<extra></extra>"
-                    ),
-                )
-            )
 
     fig.update_layout(
-        height=540,
+        height=600,
         template="plotly_white",
         xaxis_title=f"Time ({settings['time_unit']})",
-        yaxis_title="ΔF/F0",
-        legend_title="Label",
+        yaxis_title="Average ΔF/F0",
+        legend_title="Uploaded file",
     )
 
     return fig
 
 
-# -------------------------------------------------------------------
-# Export functions
-# -------------------------------------------------------------------
+def add_manual_markers_to_plot(
+    fig,
+    processed_df,
+    trace_column,
+    curated_events,
+):
+    """
+    Add manual start, peak, and endpoint markers to a Plotly figure.
+    """
+    if curated_events.empty:
+        return fig
 
-def safe_excel_sheet_name(name, used_names):
-    """Create unique Excel-compatible sheet names."""
-    cleaned = re.sub(r"[\\/*?:\[\]]", "_", str(name))
+    for _, row in curated_events.iterrows():
+        if not bool(row.get("Include", True)):
+            continue
+
+        start_frame = row.get("Start frame", np.nan)
+        peak_frame = row.get("Peak frame", np.nan)
+        end_frame = row.get("End frame", np.nan)
+
+        start_time, start_value = get_trace_value_by_frame(
+            processed_df,
+            start_frame,
+            trace_column,
+        )
+
+        peak_time, peak_value = get_trace_value_by_frame(
+            processed_df,
+            peak_frame,
+            trace_column,
+        )
+
+        end_time, end_value = get_trace_value_by_frame(
+            processed_df,
+            end_frame,
+            trace_column,
+        )
+
+        event_id = row.get("Event ID", "Manual event")
+
+        if np.isfinite([start_time, start_value]).all():
+            fig.add_trace(
+                go.Scatter(
+                    x=[start_time],
+                    y=[start_value],
+                    mode="markers+text",
+                    marker=dict(
+                        color="green",
+                        size=11,
+                    ),
+                    text=[f"{event_id} start"],
+                    textposition="bottom center",
+                    showlegend=False,
+                )
+            )
+
+        if np.isfinite([peak_time, peak_value]).all():
+            fig.add_trace(
+                go.Scatter(
+                    x=[peak_time],
+                    y=[peak_value],
+                    mode="markers+text",
+                    marker=dict(
+                        color="red",
+                        size=12,
+                    ),
+                    text=[f"{event_id} peak"],
+                    textposition="top center",
+                    showlegend=False,
+                )
+            )
+
+        if np.isfinite([end_time, end_value]).all():
+            fig.add_trace(
+                go.Scatter(
+                    x=[end_time],
+                    y=[end_value],
+                    mode="markers+text",
+                    marker=dict(
+                        color="purple",
+                        size=11,
+                    ),
+                    text=[f"{event_id} end"],
+                    textposition="bottom center",
+                    showlegend=False,
+                )
+            )
+
+        if np.isfinite(
+            [
+                start_time,
+                start_value,
+                peak_time,
+                peak_value,
+            ]
+        ).all():
+            fig.add_trace(
+                go.Scatter(
+                    x=[start_time, peak_time],
+                    y=[start_value, peak_value],
+                    mode="lines",
+                    line=dict(
+                        color="green",
+                        width=2,
+                    ),
+                    showlegend=False,
+                )
+            )
+
+        if np.isfinite(
+            [
+                peak_time,
+                peak_value,
+                end_time,
+                end_value,
+            ]
+        ).all():
+            fig.add_trace(
+                go.Scatter(
+                    x=[peak_time, end_time],
+                    y=[peak_value, end_value],
+                    mode="lines",
+                    line=dict(
+                        color="purple",
+                        width=2,
+                        dash="dash",
+                    ),
+                    showlegend=False,
+                )
+            )
+
+    return fig
+
+
+def build_selected_trace_plot(
+    processed_df,
+    trace_column,
+    file_name,
+    label,
+    settings,
+    curated_events,
+):
+    """
+    Plot a selected file-average or selected ROI trace.
+    """
+    fig = go.Figure()
+
+    x_values = processed_df["Time"].to_numpy()
+    y_values = processed_df[
+        trace_column
+    ].to_numpy()
+
+    if settings["positive_only"]:
+        y_values = np.maximum(y_values, 0)
+
+    fig.add_trace(
+        go.Scatter(
+            x=x_values,
+            y=y_values,
+            mode="lines",
+            name=f"{label} | {file_name} | {trace_column}",
+            line=dict(
+                color="#1f77b4",
+                width=3,
+            ),
+        )
+    )
+
+    fig = add_manual_markers_to_plot(
+        fig=fig,
+        processed_df=processed_df,
+        trace_column=trace_column,
+        curated_events=curated_events,
+    )
+
+    fig.update_layout(
+        height=600,
+        template="plotly_white",
+        xaxis_title=f"Time ({settings['time_unit']})",
+        yaxis_title="ΔF/F0",
+        legend_title="Trace",
+    )
+
+    return fig
+
+
+# ============================================================
+# Export
+# ============================================================
+
+def safe_sheet_name(name, used_names):
+    """
+    Make a valid unique Excel worksheet name.
+    """
+    cleaned = re.sub(
+        r"[\\/*?:\[\]]",
+        "_",
+        str(name),
+    )
+
     cleaned = cleaned[:31] or "sheet"
 
     candidate = cleaned
@@ -956,9 +1286,12 @@ def safe_excel_sheet_name(name, used_names):
 
     while candidate in used_names:
         suffix = f"_{counter}"
+
         candidate = (
-            cleaned[:31 - len(suffix)] + suffix
+            cleaned[:31 - len(suffix)]
+            + suffix
         )
+
         counter += 1
 
     used_names.add(candidate)
@@ -966,10 +1299,15 @@ def safe_excel_sheet_name(name, used_names):
     return candidate
 
 
-def make_excel_bytes(results, group_average_df, settings):
+def make_excel_bytes(
+    results,
+    settings,
+    combined_summary,
+    combined_auto_events,
+    curated_metrics,
+):
     """
-    Create an Excel workbook with raw processed traces,
-    cell summaries, and event metrics.
+    Build a full downloadable Excel workbook.
     """
     output = io.BytesIO()
     used_sheet_names = set()
@@ -979,14 +1317,15 @@ def make_excel_bytes(results, group_average_df, settings):
         engine="openpyxl",
     ) as writer:
 
-        settings_df = pd.DataFrame([settings])
-        settings_df.to_excel(
+        pd.DataFrame(
+            [settings]
+        ).to_excel(
             writer,
             index=False,
             sheet_name="analysis_settings",
         )
 
-        metadata_df = pd.DataFrame(
+        metadata = pd.DataFrame(
             [
                 {
                     "File": result["file_name"],
@@ -996,74 +1335,35 @@ def make_excel_bytes(results, group_average_df, settings):
             ]
         )
 
-        metadata_df.to_excel(
+        metadata.to_excel(
             writer,
             index=False,
             sheet_name="file_metadata",
         )
 
-        group_average_df.to_excel(
-            writer,
-            index=False,
-            sheet_name="group_average",
-        )
-
-        summary_tables = [
-            result["cell_summary_df"]
-            for result in results
-            if not result["cell_summary_df"].empty
-        ]
-
-        if summary_tables:
-            combined_summary = pd.concat(
-                summary_tables,
-                ignore_index=True,
-            )
-
+        if not combined_summary.empty:
             combined_summary.to_excel(
                 writer,
                 index=False,
                 sheet_name="cell_summary",
             )
 
-        event_tables = [
-            result["cell_events_df"]
-            for result in results
-            if not result["cell_events_df"].empty
-        ]
-
-        if event_tables:
-            combined_events = pd.concat(
-                event_tables,
-                ignore_index=True,
-            )
-
-            combined_events.to_excel(
+        if not combined_auto_events.empty:
+            combined_auto_events.to_excel(
                 writer,
                 index=False,
-                sheet_name="cell_events",
+                sheet_name="auto_candidates",
             )
 
-        average_event_tables = [
-            result["average_events_df"]
-            for result in results
-            if not result["average_events_df"].empty
-        ]
-
-        if average_event_tables:
-            combined_average_events = pd.concat(
-                average_event_tables,
-                ignore_index=True,
-            )
-
-            combined_average_events.to_excel(
+        if not curated_metrics.empty:
+            curated_metrics.to_excel(
                 writer,
                 index=False,
-                sheet_name="average_events",
+                sheet_name="manual_curated_events",
             )
 
         for result in results:
-            sheet_name = safe_excel_sheet_name(
+            sheet_name = safe_sheet_name(
                 f"trace_{result['file_name']}",
                 used_sheet_names,
             )
@@ -1079,9 +1379,9 @@ def make_excel_bytes(results, group_average_df, settings):
     return output.getvalue()
 
 
-# -------------------------------------------------------------------
+# ============================================================
 # Sidebar settings
-# -------------------------------------------------------------------
+# ============================================================
 
 with st.sidebar:
     st.header("Time settings")
@@ -1092,14 +1392,18 @@ with st.sidebar:
         value=1.0,
         step=0.1,
         help=(
-            "Time between consecutive image frames. "
-            "For example, use 2 if each frame was acquired every 2 seconds."
+            "Time between frames. For example, enter 2 "
+            "if images were acquired every 2 seconds."
         ),
     )
 
     time_unit = st.selectbox(
         "Time unit",
-        ["seconds", "minutes", "milliseconds"],
+        [
+            "seconds",
+            "minutes",
+            "milliseconds",
+        ],
         index=0,
     )
 
@@ -1114,10 +1418,6 @@ with st.sidebar:
             "No background correction",
         ],
         index=0,
-        help=(
-            "Recommended: subtract Mean(background) from each cellular "
-            "Mean trace at every frame before calculating F0 and ΔF/F0."
-        ),
     )
 
     negative_signal_policy = st.radio(
@@ -1129,8 +1429,8 @@ with st.sidebar:
         ],
         index=0,
         help=(
-            "Applied after background subtraction and before F0 calculation. "
-            "The recommended option preserves all corrected measurements."
+            "Applied after background subtraction. "
+            "The default preserves values below zero."
         ),
     )
 
@@ -1177,17 +1477,17 @@ with st.sidebar:
 
     st.divider()
 
-    st.header("Peak and rate settings")
+    st.header("Automatic candidate settings")
 
     min_peak_height = st.number_input(
-        "Minimum peak height (ΔF/F0)",
+        "Minimum candidate peak height (ΔF/F0)",
         min_value=0.0,
         value=0.05,
         step=0.01,
     )
 
     min_peak_prominence = st.number_input(
-        "Minimum peak prominence (ΔF/F0)",
+        "Minimum candidate prominence (ΔF/F0)",
         min_value=0.0,
         value=0.05,
         step=0.01,
@@ -1195,17 +1495,8 @@ with st.sidebar:
 
     min_peak_distance = int(
         st.number_input(
-            "Minimum frames between peaks",
+            "Minimum frames between candidates",
             min_value=1,
-            value=3,
-            step=1,
-        )
-    )
-
-    min_event_points = int(
-        st.number_input(
-            "Minimum points in rise/decay",
-            min_value=2,
             value=3,
             step=1,
         )
@@ -1215,18 +1506,13 @@ with st.sidebar:
 
     st.header("Display settings")
 
-    show_sem = st.checkbox(
-        "Show SEM across files sharing a label",
-        value=True,
-    )
-
     positive_only = st.checkbox(
         "Plot only positive ΔF/F0",
         value=False,
     )
 
-    show_events = st.checkbox(
-        "Mark accepted peaks",
+    show_auto_peaks = st.checkbox(
+        "Show automatic candidate peaks",
         value=True,
     )
 
@@ -1239,9 +1525,9 @@ with st.sidebar:
     )
 
 
-# -------------------------------------------------------------------
-# File upload
-# -------------------------------------------------------------------
+# ============================================================
+# Upload
+# ============================================================
 
 uploaded_files = st.file_uploader(
     "Upload calcium time-series files",
@@ -1249,33 +1535,33 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True,
     key=f"calcium_files_{st.session_state.uploader_token}",
     help=(
-        "Expected format: Label, frame/time column, Mean1...MeanN, "
-        "and Mean(background). Area columns are retained as metadata "
-        "but are not treated as fluorescence signals."
+        "Each file may contain any number of cellular columns named "
+        "Mean1, Mean2, Mean3, etc. Mean(background) is used as "
+        "the empty-area background trace."
     ),
 )
 
 if not uploaded_files:
     st.info(
-        "Upload one or more calcium time-series files to begin analysis."
+        "Upload one or more calcium imaging CSV/XLSX files to begin."
     )
     st.stop()
 
 
-# -------------------------------------------------------------------
-# Read uploads
-# -------------------------------------------------------------------
+# ============================================================
+# Read uploaded files
+# ============================================================
 
 loaded_files = []
 
 for uploaded_file in uploaded_files:
     try:
-        df = read_table(uploaded_file)
+        file_df = read_table(uploaded_file)
 
         loaded_files.append(
             {
                 "file_name": uploaded_file.name,
-                "df": df,
+                "df": file_df,
             }
         )
 
@@ -1288,28 +1574,28 @@ if not loaded_files:
     st.stop()
 
 
-# -------------------------------------------------------------------
-# Show automatic detection
-# -------------------------------------------------------------------
+# ============================================================
+# Auto-detected structure
+# ============================================================
 
 st.subheader("Detected column structure")
 
 detection_rows = []
 
 for item in loaded_files:
-    detected = detect_columns(item["df"])
+    detection = detect_columns(item["df"])
 
     detection_rows.append(
         {
             "File": item["file_name"],
-            "Suggested label column": detected["label_col"],
-            "Suggested frame/time column": detected["time_col"],
-            "Suggested cell Mean columns": ", ".join(
-                map(str, detected["signal_cols"])
+            "Detected label": detection["label_column"],
+            "Detected frame/time": detection["time_column"],
+            "Detected background": detection["background_column"],
+            "Detected ROI Mean columns": ", ".join(
+                detection["signal_columns"]
             ),
-            "Suggested background column": detected["background_col"],
-            "Detected Area columns": ", ".join(
-                map(str, detected["area_cols"])
+            "Number of ROI traces": len(
+                detection["signal_columns"]
             ),
         }
     )
@@ -1320,28 +1606,31 @@ st.dataframe(
 )
 
 
-# -------------------------------------------------------------------
-# Shared column mapping
-# -------------------------------------------------------------------
+# ============================================================
+# Shared mappings
+# ============================================================
 
 first_df = loaded_files[0]["df"]
-first_detected = detect_columns(first_df)
-all_columns = first_df.columns.tolist()
+first_detection = detect_columns(first_df)
+first_columns = first_df.columns.tolist()
 
 with st.expander(
-    "Column mapping (applied to all uploaded files)",
+    "Shared column mapping",
     expanded=True,
 ):
-    mapping_col1, mapping_col2, mapping_col3, mapping_col4 = st.columns(4)
+    map_col1, map_col2, map_col3, map_col4 = st.columns(4)
 
-    with mapping_col1:
-        label_options = ["<none>"] + all_columns
+    with map_col1:
+        label_options = ["<auto/file name>"] + first_columns
 
         default_label_index = 0
 
-        if first_detected["label_col"] in all_columns:
+        if first_detection["label_column"] in first_columns:
             default_label_index = (
-                all_columns.index(first_detected["label_col"]) + 1
+                first_columns.index(
+                    first_detection["label_column"]
+                )
+                + 1
             )
 
         selected_label_column = st.selectbox(
@@ -1350,14 +1639,17 @@ with st.expander(
             index=default_label_index,
         )
 
-    with mapping_col2:
-        time_options = ["<auto index>"] + all_columns
+    with map_col2:
+        time_options = ["<auto row index>"] + first_columns
 
         default_time_index = 0
 
-        if first_detected["time_col"] in all_columns:
+        if first_detection["time_column"] in first_columns:
             default_time_index = (
-                all_columns.index(first_detected["time_col"]) + 1
+                first_columns.index(
+                    first_detection["time_column"]
+                )
+                + 1
             )
 
         selected_time_column = st.selectbox(
@@ -1366,14 +1658,16 @@ with st.expander(
             index=default_time_index,
         )
 
-    with mapping_col3:
-        background_options = ["<none>"] + all_columns
+    with map_col3:
+        background_options = ["<none>"] + first_columns
 
         default_background_index = 0
 
-        if first_detected["background_col"] in all_columns:
-            default_background_index = background_options.index(
-                first_detected["background_col"]
+        if first_detection["background_column"] in first_columns:
+            default_background_index = (
+                background_options.index(
+                    first_detection["background_column"]
+                )
             )
 
         selected_background_column = st.selectbox(
@@ -1382,37 +1676,35 @@ with st.expander(
             index=default_background_index,
         )
 
-    with mapping_col4:
+    with map_col4:
         st.info(
-            "ROI signal columns are detected independently in every file. "
-            "All columns named Mean1, Mean2, Mean3, etc. are analyzed. "
-            "Mean(background) is reserved for background correction."
+            "All ROI traces are detected independently in every uploaded "
+            "file. The app analyzes every column matching Mean1, Mean2, "
+            "Mean3, etc. A file may contain 5, 10, 20, or more ROIs."
         )
 
 
 if (
-    background_mode == "Subtract empty-area background before ΔF/F0"
+    background_mode
+    == "Subtract empty-area background before ΔF/F0"
     and selected_background_column == "<none>"
 ):
     st.error(
-        "Select Mean(background) as the empty-area background column, "
-        "or select 'No background correction'."
+        "Select Mean(background) as the background column or choose "
+        "'No background correction'."
     )
     st.stop()
 
-# -------------------------------------------------------------------
-# Build settings and validate mapping
-# -------------------------------------------------------------------
 
 settings = {
     "label_column": (
         None
-        if selected_label_column == "<none>"
+        if selected_label_column == "<auto/file name>"
         else selected_label_column
     ),
     "time_column": (
         None
-        if selected_time_column == "<auto index>"
+        if selected_time_column == "<auto row index>"
         else selected_time_column
     ),
     "background_column": (
@@ -1431,11 +1723,14 @@ settings = {
     "min_peak_height": min_peak_height,
     "min_peak_prominence": min_peak_prominence,
     "min_peak_distance": min_peak_distance,
-    "min_event_points": min_event_points,
-    "show_sem": show_sem,
     "positive_only": positive_only,
-    "show_events": show_events,
+    "show_auto_peaks": show_auto_peaks,
 }
+
+
+# ============================================================
+# Validate mappings for every file
+# ============================================================
 
 mapping_errors = []
 mapping_warnings = []
@@ -1443,13 +1738,12 @@ mapping_warnings = []
 for item in loaded_files:
     file_name = item["file_name"]
     df = item["df"]
-    detected = detect_columns(df)
-    file_signal_columns = detected["signal_cols"]
 
-    if not file_signal_columns:
+    detection = detect_columns(df)
+
+    if not detection["signal_columns"]:
         mapping_errors.append(
-            f"{file_name}: no cellular Mean ROI columns were detected. "
-            "Expected columns such as Mean1, Mean2, Mean3, etc."
+            f"{file_name}: no Mean1...MeanN ROI columns detected."
         )
 
     if (
@@ -1457,7 +1751,7 @@ for item in loaded_files:
         and settings["background_column"] not in df.columns
     ):
         mapping_errors.append(
-            f"{file_name}: missing required empty-area background column "
+            f"{file_name}: missing selected background column "
             f"'{settings['background_column']}'."
         )
 
@@ -1466,7 +1760,7 @@ for item in loaded_files:
         and settings["time_column"] not in df.columns
     ):
         mapping_errors.append(
-            f"{file_name}: missing required frame/time column "
+            f"{file_name}: missing selected time/frame column "
             f"'{settings['time_column']}'."
         )
 
@@ -1475,8 +1769,9 @@ for item in loaded_files:
         and settings["label_column"] not in df.columns
     ):
         mapping_warnings.append(
-            f"{file_name}: label column '{settings['label_column']}' "
-            "was not found; the filename will be used as the label."
+            f"{file_name}: label column "
+            f"'{settings['label_column']}' not found; filename will "
+            "be used as the label."
         )
 
 for warning in mapping_warnings:
@@ -1489,25 +1784,19 @@ if mapping_errors:
     )
     st.stop()
 
-# -------------------------------------------------------------------
-# Process all files
-# -------------------------------------------------------------------
+
+# ============================================================
+# Process every uploaded file
+# ============================================================
 
 results = []
 
 for item in loaded_files:
-    file_name = item["file_name"]
-    df = item["df"]
-
-    detected = detect_columns(df)
-    file_signal_columns = detected["signal_cols"]
-
     file_settings = settings.copy()
-    file_settings["signal_columns"] = file_signal_columns
 
     result = process_calcium_file(
-        df=df,
-        file_name=file_name,
+        df=item["df"],
+        file_name=item["file_name"],
         settings=file_settings,
     )
 
@@ -1522,175 +1811,330 @@ for warning in all_warnings:
     st.warning(warning)
 
 
-# -------------------------------------------------------------------
-# Build averages and plot
-# -------------------------------------------------------------------
+# ============================================================
+# Main graph: all uploaded files
+# ============================================================
 
-file_average_long = build_file_average_long_table(results)
+st.subheader("All uploaded file-average traces")
 
-group_average_df = build_group_average_table(
-    file_average_long
-)
-
-trace_plot = build_trace_plot(
-    grouped_df=group_average_df,
+main_plot = build_file_trace_plot(
     results=results,
     settings=settings,
 )
 
-st.subheader("Average calcium traces")
-
 st.plotly_chart(
-    trace_plot,
+    main_plot,
     use_container_width=True,
 )
 
 
-# -------------------------------------------------------------------
-# Processed-file preview
-# -------------------------------------------------------------------
+# ============================================================
+# Summaries and automatic candidates
+# ============================================================
 
-st.subheader("Processed data preview")
-
-selected_file_name = st.selectbox(
-    "Select uploaded file",
-    [result["file_name"] for result in results],
-)
-
-selected_result = next(
-    result
-    for result in results
-    if result["file_name"] == selected_file_name
-)
-
-st.caption(
-    f"Extracted label: {selected_result['label']}"
-)
-
-st.dataframe(
-    selected_result["processed_df"],
-    use_container_width=True,
-    height=350,
-)
-
-
-# -------------------------------------------------------------------
-# Cell/ROI summaries
-# -------------------------------------------------------------------
-
-st.subheader("Cell/ROI summary")
-
-cell_summary_tables = [
+summary_tables = [
     result["cell_summary_df"]
     for result in results
     if not result["cell_summary_df"].empty
 ]
 
-if cell_summary_tables:
-    combined_cell_summary = pd.concat(
-        cell_summary_tables,
+if summary_tables:
+    combined_summary = pd.concat(
+        summary_tables,
         ignore_index=True,
     )
+else:
+    combined_summary = pd.DataFrame()
 
+auto_event_tables = []
+
+for result in results:
+    if not result["cell_auto_events_df"].empty:
+        auto_event_tables.append(
+            result["cell_auto_events_df"]
+        )
+
+    if not result["average_auto_events_df"].empty:
+        auto_event_tables.append(
+            result["average_auto_events_df"]
+        )
+
+if auto_event_tables:
+    combined_auto_events = pd.concat(
+        auto_event_tables,
+        ignore_index=True,
+    )
+else:
+    combined_auto_events = pd.DataFrame()
+
+st.subheader("Cell/ROI summary")
+
+st.dataframe(
+    combined_summary,
+    use_container_width=True,
+)
+
+st.subheader("Automatic candidate peaks")
+
+st.caption(
+    "These are candidate local maxima for review. They are not automatically "
+    "treated as final uptake/release events."
+)
+
+if combined_auto_events.empty:
+    st.info(
+        "No automatic candidate peaks met the current height, prominence, "
+        "and distance criteria."
+    )
+else:
     st.dataframe(
-        combined_cell_summary,
+        combined_auto_events,
         use_container_width=True,
     )
 
-else:
-    combined_cell_summary = pd.DataFrame()
 
-    st.info("No valid cell/ROI summaries were generated.")
+# ============================================================
+# Manual event curation
+# ============================================================
 
+st.subheader("Manual event curation")
 
-# -------------------------------------------------------------------
-# Events and uptake/release rates
-# -------------------------------------------------------------------
-
-st.subheader("Significant calcium events and kinetic rates")
-
-st.markdown(
-    "- **Uptake slope:** linear-regression slope from the last zero/baseline "
-    "crossing before the accepted peak to the peak.\n"
-    "- **Release slope:** linear-regression slope from the peak to the first "
-    "return to zero or below. Release slopes are expected to be negative.\n"
-    "- **Release magnitude:** the positive value of the negative release slope.\n"
-    "- **No return to baseline:** the event remains in the output, but its "
-    "release metrics are not calculated.\n"
-    "- **Accepted peaks:** must meet your selected height, prominence, "
-    "minimum separation, and minimum segment-length criteria."
+st.write(
+    "Select biologically meaningful start, peak, and endpoint frames. "
+    "The endpoint may be zero, a post-peak trough, the point before a "
+    "new rise, or the recording end. Manual selections determine the "
+    "final uptake and observed-decay metrics."
 )
 
-cell_event_tables = [
-    result["cell_events_df"]
+curation_file_name = st.selectbox(
+    "File for manual curation",
+    [result["file_name"] for result in results],
+)
+
+curation_result = next(
+    result
     for result in results
-    if not result["cell_events_df"].empty
+    if result["file_name"] == curation_file_name
+)
+
+curation_processed_df = curation_result["processed_df"]
+
+trace_options = ["Average dF/F0"] + [
+    column
+    for column in curation_processed_df.columns
+    if column.startswith("dF/F0 | ")
 ]
 
-average_event_tables = [
-    result["average_events_df"]
-    for result in results
-    if not result["average_events_df"].empty
-]
+selected_trace_column = st.selectbox(
+    "Trace for manual curation",
+    trace_options,
+)
 
-if cell_event_tables:
-    combined_cell_events = pd.concat(
-        cell_event_tables,
-        ignore_index=True,
-    )
-else:
-    combined_cell_events = pd.DataFrame()
+frame_options = (
+    curation_processed_df["Frame"]
+    .dropna()
+    .astype(int)
+    .tolist()
+)
 
-if average_event_tables:
-    combined_average_events = pd.concat(
-        average_event_tables,
-        ignore_index=True,
-    )
-else:
-    combined_average_events = pd.DataFrame()
+default_peak_frames = []
 
-events_tab1, events_tab2 = st.tabs(
-    [
-        "Individual cell/ROI events",
-        "File-average events",
+if selected_trace_column == "Average dF/F0":
+    default_auto_events = curation_result[
+        "average_auto_events_df"
     ]
+
+    if not default_auto_events.empty:
+        default_peak_frames = (
+            default_auto_events["Peak frame"]
+            .astype(int)
+            .tolist()
+        )
+
+else:
+    selected_roi_name = selected_trace_column.replace(
+        "dF/F0 | ",
+        "",
+    )
+
+    default_auto_events = curation_result[
+        "cell_auto_events_df"
+    ]
+
+    if not default_auto_events.empty:
+        default_auto_events = default_auto_events[
+            default_auto_events["ROI"] == selected_roi_name
+        ]
+
+        default_peak_frames = (
+            default_auto_events["Peak frame"]
+            .astype(int)
+            .tolist()
+        )
+
+if not default_peak_frames:
+    default_peak_frames = [
+        frame_options[
+            int(len(frame_options) / 2)
+        ]
+    ]
+
+default_manual_events = pd.DataFrame(
+    {
+        "Event ID": [
+            f"E{number}"
+            for number in range(
+                1,
+                len(default_peak_frames) + 1,
+            )
+        ],
+        "Start frame": [
+            max(
+                frame_options[0],
+                peak_frame - 1,
+            )
+            for peak_frame in default_peak_frames
+        ],
+        "Peak frame": default_peak_frames,
+        "End frame": [
+            min(
+                frame_options[-1],
+                peak_frame + 1,
+            )
+            for peak_frame in default_peak_frames
+        ],
+        "Event category": [
+            "Manual event"
+            for _ in default_peak_frames
+        ],
+        "Endpoint type": [
+            "Manual endpoint"
+            for _ in default_peak_frames
+        ],
+        "Include": [
+            True
+            for _ in default_peak_frames
+        ],
+        "Notes": [
+            ""
+            for _ in default_peak_frames
+        ],
+    }
 )
 
-with events_tab1:
-    if combined_cell_events.empty:
-        st.info(
-            "No individual cell/ROI events met the current significance criteria."
-        )
-    else:
-        st.dataframe(
-            combined_cell_events,
-            use_container_width=True,
-        )
+st.caption(
+    "Edit frames directly. Use the plus button in the table to add events. "
+    "For every included event, Start frame must be before Peak frame, and "
+    "Peak frame must be before End frame."
+)
 
-with events_tab2:
-    if combined_average_events.empty:
-        st.info(
-            "No file-average events met the current significance criteria."
-        )
-    else:
-        st.dataframe(
-            combined_average_events,
-            use_container_width=True,
-        )
+edited_manual_events = st.data_editor(
+    default_manual_events,
+    num_rows="dynamic",
+    use_container_width=True,
+    key=(
+        f"manual_events_"
+        f"{curation_file_name}_"
+        f"{selected_trace_column}"
+    ),
+    column_config={
+        "Event ID": st.column_config.TextColumn(
+            "Event ID"
+        ),
+        "Start frame": st.column_config.SelectboxColumn(
+            "Start frame",
+            options=frame_options,
+        ),
+        "Peak frame": st.column_config.SelectboxColumn(
+            "Peak frame",
+            options=frame_options,
+        ),
+        "End frame": st.column_config.SelectboxColumn(
+            "End frame",
+            options=frame_options,
+        ),
+        "Event category": st.column_config.SelectboxColumn(
+            "Event category",
+            options=[
+                "Manual event",
+                "Complete response",
+                "Partial decay",
+                "Overlapping response",
+                "Sustained plateau",
+                "Rejected / noise",
+            ],
+        ),
+        "Endpoint type": st.column_config.SelectboxColumn(
+            "Endpoint type",
+            options=[
+                "Returned to baseline",
+                "Post-peak trough",
+                "Before next rise",
+                "Recording end",
+                "Sustained plateau",
+                "Manual endpoint",
+            ],
+        ),
+        "Include": st.column_config.CheckboxColumn(
+            "Include"
+        ),
+        "Notes": st.column_config.TextColumn(
+            "Notes"
+        ),
+    },
+)
+
+manual_metrics = calculate_manual_event_metrics(
+    processed_df=curation_processed_df,
+    trace_column=selected_trace_column,
+    curated_event_df=edited_manual_events,
+)
+
+manual_plot = build_selected_trace_plot(
+    processed_df=curation_processed_df,
+    trace_column=selected_trace_column,
+    file_name=curation_result["file_name"],
+    label=curation_result["label"],
+    settings=settings,
+    curated_events=edited_manual_events,
+)
+
+st.subheader("Manual-event trace and selected points")
+
+st.plotly_chart(
+    manual_plot,
+    use_container_width=True,
+)
+
+st.subheader("Manual uptake and observed-decay metrics")
+
+if manual_metrics.empty:
+    st.info(
+        "Add valid manual events with Start frame < Peak frame < End frame."
+    )
+else:
+    st.dataframe(
+        manual_metrics,
+        use_container_width=True,
+    )
 
 
-# -------------------------------------------------------------------
+# ============================================================
 # Downloads
-# -------------------------------------------------------------------
+# ============================================================
 
 st.subheader("Downloads")
 
-timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+timestamp = datetime.now().strftime(
+    "%Y%m%d_%H%M%S"
+)
 
 excel_bytes = make_excel_bytes(
     results=results,
-    group_average_df=group_average_df,
     settings=settings,
+    combined_summary=combined_summary,
+    combined_auto_events=combined_auto_events,
+    curated_metrics=manual_metrics,
 )
 
 download_col1, download_col2, download_col3, download_col4 = st.columns(4)
@@ -1709,34 +2153,42 @@ with download_col1:
 
 with download_col2:
     st.download_button(
-        "Download group averages CSV",
-        data=group_average_df.to_csv(index=False).encode("utf-8"),
-        file_name=f"calcium_group_average_{timestamp}.csv",
+        "Download cell summary CSV",
+        data=combined_summary.to_csv(
+            index=False
+        ).encode("utf-8"),
+        file_name=f"calcium_cell_summary_{timestamp}.csv",
         mime="text/csv",
         use_container_width=True,
     )
 
 with download_col3:
     st.download_button(
-        "Download cell summary CSV",
-        data=combined_cell_summary.to_csv(index=False).encode("utf-8"),
-        file_name=f"calcium_cell_summary_{timestamp}.csv",
+        "Download auto candidates CSV",
+        data=combined_auto_events.to_csv(
+            index=False
+        ).encode("utf-8"),
+        file_name=f"calcium_auto_candidates_{timestamp}.csv",
         mime="text/csv",
         use_container_width=True,
     )
 
 with download_col4:
     st.download_button(
-        "Download event metrics CSV",
-        data=combined_cell_events.to_csv(index=False).encode("utf-8"),
-        file_name=f"calcium_events_{timestamp}.csv",
+        "Download manual metrics CSV",
+        data=manual_metrics.to_csv(
+            index=False
+        ).encode("utf-8"),
+        file_name=f"calcium_manual_events_{timestamp}.csv",
         mime="text/csv",
         use_container_width=True,
     )
 
 st.download_button(
-    "Download interactive graph HTML",
-    data=trace_plot.to_html(include_plotlyjs="cdn"),
-    file_name=f"calcium_trace_{timestamp}.html",
+    "Download all-file graph HTML",
+    data=main_plot.to_html(
+        include_plotlyjs="cdn"
+    ),
+    file_name=f"calcium_all_files_{timestamp}.html",
     mime="text/html",
 )
