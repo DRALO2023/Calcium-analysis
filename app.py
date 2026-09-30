@@ -1364,6 +1364,11 @@ with st.expander(
             default=first_detected["signal_cols"],
         )
 
+    st.caption(
+        "Files may contain different numbers of Mean ROI columns. "
+        "Each file will use only the selected columns available in that file."
+    )
+
 
 if (
     background_mode == "Subtract empty-area background before ΔF/F0"
@@ -1418,40 +1423,73 @@ settings = {
 }
 
 mapping_errors = []
+mapping_warnings = []
 
 for item in loaded_files:
     file_name = item["file_name"]
     df = item["df"]
 
-    needed_columns = list(selected_signal_columns)
+    available_signal_columns = [
+        column
+        for column in selected_signal_columns
+        if column in df.columns
+    ]
 
-    if settings["background_column"] is not None:
-        needed_columns.append(settings["background_column"])
-
-    if settings["time_column"] is not None:
-        needed_columns.append(settings["time_column"])
-
-    if settings["label_column"] is not None:
-        needed_columns.append(settings["label_column"])
-
-    missing_columns = [
-        column for column in needed_columns
+    missing_signal_columns = [
+        column
+        for column in selected_signal_columns
         if column not in df.columns
     ]
 
-    if missing_columns:
-        mapping_errors.append(
-            f"{file_name}: missing columns: "
-            f"{', '.join(map(str, missing_columns))}"
+    if missing_signal_columns:
+        mapping_warnings.append(
+            f"{file_name}: using {len(available_signal_columns)} available "
+            f"ROI signal column(s); skipped missing columns: "
+            f"{', '.join(map(str, missing_signal_columns))}"
         )
+
+    if not available_signal_columns:
+        mapping_errors.append(
+            f"{file_name}: none of the selected cell signal columns "
+            "were found in this file."
+        )
+
+    if (
+        settings["background_column"] is not None
+        and settings["background_column"] not in df.columns
+    ):
+        mapping_errors.append(
+            f"{file_name}: missing required background column "
+            f"'{settings['background_column']}'."
+        )
+
+    if (
+        settings["time_column"] is not None
+        and settings["time_column"] not in df.columns
+    ):
+        mapping_errors.append(
+            f"{file_name}: missing required frame/time column "
+            f"'{settings['time_column']}'."
+        )
+
+    if (
+        settings["label_column"] is not None
+        and settings["label_column"] not in df.columns
+    ):
+        mapping_warnings.append(
+            f"{file_name}: label column '{settings['label_column']}' "
+            "was not found; the filename will be used as the label."
+        )
+
+for warning in mapping_warnings:
+    st.warning(warning)
 
 if mapping_errors:
     st.error(
-        "The selected column mapping cannot be applied to every file:\n\n"
+        "Some uploaded files cannot be analyzed:\n\n"
         + "\n".join(mapping_errors)
     )
     st.stop()
-
 
 # -------------------------------------------------------------------
 # Process all files
@@ -1460,10 +1498,22 @@ if mapping_errors:
 results = []
 
 for item in loaded_files:
+    file_name = item["file_name"]
+    df = item["df"]
+
+    available_signal_columns = [
+        column
+        for column in selected_signal_columns
+        if column in df.columns
+    ]
+
+    file_settings = settings.copy()
+    file_settings["signal_columns"] = available_signal_columns
+
     result = process_calcium_file(
-        df=item["df"],
-        file_name=item["file_name"],
-        settings=settings,
+        df=df,
+        file_name=file_name,
+        settings=file_settings,
     )
 
     results.append(result)
